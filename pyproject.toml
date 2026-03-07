@@ -1,0 +1,25 @@
+[project]
+name = "ti-ppo"
+version = "0.1.0"
+description = "Token-Importance Guided Proximal Policy Optimization for LLM Alignment"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.38.0",
+    "trl>=0.8.0",
+    "datasets>=2.16.0",
+    "accelerate>=0.27.0",
+    "peft>=0.9.0",
+    "bitsandbytes>=0.42.0",
+    "wandb>=0.16.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
