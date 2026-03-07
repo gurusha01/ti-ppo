@@ -8,3 +8,4 @@ from .token_importance import (
 )
 from .trainer import TIPPOTrainer
 from .config import TIPPOConfig
+from .value_head import CausalLMWithValueHead

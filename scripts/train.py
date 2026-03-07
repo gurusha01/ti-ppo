@@ -1,28 +1,30 @@
 """Training script for TI-PPO.
 
 Usage:
-    python scripts/train.py                          # defaults (hybrid importance)
-    python scripts/train.py --importance_method attention   # simpler alternative
-    python scripts/train.py --importance_method uniform     # ablation: standard PPO
+    python scripts/train.py                                  # defaults (hybrid importance)
+    python scripts/train.py --importance_method attention     # simpler alternative
+    python scripts/train.py --importance_method uniform       # ablation: standard PPO
 """
 
 import argparse
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from trl import AutoModelForCausalLMWithValueHead
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model
 
-from ti_ppo import TIPPOConfig, TIPPOTrainer
+from ti_ppo import TIPPOConfig, TIPPOTrainer, CausalLMWithValueHead
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train TI-PPO")
-    # Allow overriding any TIPPOConfig field
     for field_name, field_obj in TIPPOConfig.__dataclass_fields__.items():
         ftype = field_obj.type
         if ftype == "bool":
-            parser.add_argument(f"--{field_name}", type=lambda x: x.lower() == "true", default=field_obj.default)
+            parser.add_argument(
+                f"--{field_name}",
+                type=lambda x: x.lower() == "true",
+                default=field_obj.default,
+            )
         elif ftype == "float":
             parser.add_argument(f"--{field_name}", type=float, default=field_obj.default)
         elif ftype == "int":
@@ -37,8 +39,6 @@ def build_dataset(dataset_name, tokenizer, max_prompt_length, split="train"):
     ds = load_dataset(dataset_name, split=split)
 
     def extract_prompt(example):
-        # hh-rlhf format: "chosen" and "rejected" are full conversations
-        # Extract the human turn as the prompt
         text = example.get("chosen", example.get("prompt", ""))
         if "\n\nHuman:" in text:
             prompt = text.split("\n\nAssistant:")[0] + "\n\nAssistant:"
@@ -82,7 +82,12 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Policy model with value head
-    lora_config = None
+    model = CausalLMWithValueHead.from_pretrained(
+        config.model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+
     if config.use_peft:
         lora_config = LoraConfig(
             r=config.lora_r,
@@ -91,20 +96,17 @@ def main():
             bias="none",
             task_type="CAUSAL_LM",
         )
+        model.pretrained_model = get_peft_model(model.pretrained_model, lora_config)
+        model.pretrained_model.print_trainable_parameters()
 
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        config.model_name,
-        peft_config=lora_config,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
-
-    # Reference model (frozen copy)
-    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+    # Reference model (frozen copy, no value head needed)
+    ref_model = CausalLMWithValueHead.from_pretrained(
         config.model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
+    for p in ref_model.parameters():
+        p.requires_grad = False
 
     # Reward model
     print(f"Loading reward model: {config.reward_model_name}")
@@ -114,7 +116,9 @@ def main():
         device_map="auto",
         num_labels=1,
     )
-    reward_tokenizer = AutoTokenizer.from_pretrained(config.reward_model_name)
+    reward_model.eval()
+    for p in reward_model.parameters():
+        p.requires_grad = False
 
     # Dataset
     print(f"Loading dataset: {config.dataset_name}")
@@ -127,7 +131,6 @@ def main():
         ref_model=ref_model,
         tokenizer=tokenizer,
         reward_model=reward_model,
-        reward_tokenizer=reward_tokenizer,
     )
 
     # Training loop
@@ -149,36 +152,42 @@ def main():
     }
 
     episode = 0
-    for epoch in range(100):  # outer loop; we break on total_episodes
+    for epoch in range(100):
         for batch in dataloader:
             if episode >= config.total_episodes:
                 break
 
-            query_tensors = [torch.tensor(ids) for ids in batch["input_ids"]]
+            query_tensors = [ids.to(model.device) for ids in batch["input_ids"]]
 
             # Generate responses
-            response_tensors = trainer.ppo_trainer.generate(
-                query_tensors, return_prompt=False, **generation_kwargs
-            )
-
-            # Decode for logging
-            batch_responses = [tokenizer.decode(r.squeeze(), skip_special_tokens=True) for r in response_tensors]
+            response_tensors = []
+            for qt in query_tensors:
+                out = model.generate(
+                    input_ids=qt.unsqueeze(0), **generation_kwargs
+                )
+                resp = out[0, qt.shape[0] :]
+                response_tensors.append(resp)
 
             # Get rewards from reward model
             rewards = trainer.get_rewards(query_tensors, response_tensors)
 
+            # Filter out empty responses
+            valid = [(q, r, s) for q, r, s in zip(query_tensors, response_tensors, rewards) if r.shape[0] > 0]
+            if not valid:
+                continue
+            query_tensors, response_tensors, rewards = zip(*valid)
+            query_tensors, response_tensors, rewards = list(query_tensors), list(response_tensors), list(rewards)
+
             # TI-PPO step
             stats = trainer.step(query_tensors, response_tensors, rewards)
 
-            # Logging
             if episode % 10 == 0:
-                mean_reward = torch.stack(rewards).mean().item()
                 print(
                     f"[Episode {episode:>5d}] "
-                    f"reward={mean_reward:.3f}  "
-                    f"kl={stats.get('ppo/mean_kl', 0):.3f}  "
-                    f"importance_mean={stats.get('ti_ppo/mean_importance', 0):.3f}  "
-                    f"importance_std={stats.get('ti_ppo/importance_std', 0):.3f}"
+                    f"reward={stats['ppo/mean_reward']:.3f}  "
+                    f"kl={stats['ppo/mean_kl']:.4f}  "
+                    f"policy_loss={stats['ppo/policy_loss']:.4f}  "
+                    f"importance={stats['ti_ppo/mean_importance']:.3f}"
                 )
 
             episode += 1
@@ -188,7 +197,10 @@ def main():
 
     # Save
     print(f"\nSaving model to {config.output_dir}/")
-    model.save_pretrained(config.output_dir)
+    if config.use_peft:
+        model.pretrained_model.save_pretrained(config.output_dir)
+    else:
+        model.pretrained_model.save_pretrained(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
     print("Done.")
 

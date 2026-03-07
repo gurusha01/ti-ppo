@@ -1,88 +1,70 @@
 """TI-PPO Trainer: Token-Importance Guided PPO for LLM alignment.
 
-Extends the standard PPO-RLHF loop with:
+Pure PyTorch implementation of PPO-RLHF with:
 1. Per-token importance weighting on the policy/value objectives
 2. Optional triplet loss (anchor=model output, positive=preferred, negative=rejected)
 3. EMA-smoothed importance scores to reduce compute of gradient attribution
+4. GAE advantage estimation
+5. KL penalty against reference model
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 from typing import Optional
-import numpy as np
-
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
-from transformers import AutoTokenizer
+import math
 
 from .token_importance import build_scorer, TokenImportanceScorer
 from .config import TIPPOConfig
 
 
 class TIPPOTrainer:
-    """Wraps trl.PPOTrainer with token-importance weighting and triplet loss."""
+    """Full PPO-RLHF trainer with token-importance weighting."""
 
     def __init__(
         self,
         config: TIPPOConfig,
-        model: AutoModelForCausalLMWithValueHead,
-        ref_model: Optional[AutoModelForCausalLMWithValueHead],
-        tokenizer: AutoTokenizer,
+        model,
+        ref_model,
+        tokenizer,
         reward_model=None,
-        reward_tokenizer=None,
+        optimizer=None,
     ):
         self.config = config
         self.model = model
         self.ref_model = ref_model
         self.tokenizer = tokenizer
         self.reward_model = reward_model
-        self.reward_tokenizer = reward_tokenizer
 
-        # Build PPO config
-        self.ppo_config = PPOConfig(
-            model_name=config.model_name,
-            learning_rate=config.learning_rate,
-            batch_size=config.batch_size,
-            mini_batch_size=config.mini_batch_size,
-            ppo_epochs=config.ppo_epochs,
-            max_grad_norm=config.max_grad_norm,
-            cliprange=config.clip_epsilon,
-            vf_coef=config.vf_coef,
-            gamma=config.gamma,
-            lam=config.lam,
-            kl_penalty=config.kl_penalty,
-            target_kl=config.target_kl,
-            seed=config.seed,
-            log_with=config.log_with if config.log_with != "none" else None,
-            project_kwargs={"project_name": config.project_name},
-        )
-
-        self.ppo_trainer = PPOTrainer(
-            config=self.ppo_config,
-            model=model,
-            ref_model=ref_model,
-            tokenizer=tokenizer,
-        )
-
-        # Token importance scorer
+        self.device = model.device
         self.scorer = build_scorer(config)
         self.step_count = 0
-
-        # Cache for EMA-smoothed importance scores
         self._importance_cache = None
 
+        # Optimizer: only train policy model params
+        if optimizer is None:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(), lr=config.learning_rate
+            )
+        else:
+            self.optimizer = optimizer
+
+    # ------------------------------------------------------------------
+    # Token importance
+    # ------------------------------------------------------------------
+
     def compute_importance_weights(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         values: Optional[torch.Tensor] = None,
         rewards: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute or retrieve cached token importance weights."""
         method = self.config.importance_method
 
         should_recompute = (
             self._importance_cache is None
-            or self._importance_cache.shape != (input_ids.shape[0], input_ids.shape[1])
+            or self._importance_cache.shape != input_ids.shape
             or self.step_count % self.config.importance_update_freq == 0
         )
 
@@ -91,13 +73,10 @@ class TIPPOTrainer:
 
         kwargs = dict(input_ids=input_ids, attention_mask=attention_mask)
 
-        if method in ("hybrid", "gradient"):
-            kwargs["model"] = self.model.pretrained_model
-        elif method == "attention":
+        if method in ("hybrid", "gradient", "attention"):
             kwargs["model"] = self.model.pretrained_model
         elif method == "td_error":
             if values is None or rewards is None:
-                # Fallback to uniform if values/rewards not available yet
                 return torch.ones_like(input_ids, dtype=torch.float32)
             kwargs["values"] = values
             kwargs["rewards"] = rewards
@@ -114,69 +93,60 @@ class TIPPOTrainer:
         self._importance_cache = weights.detach()
         return weights
 
-    def weighted_ppo_loss(
-        self,
-        old_logprobs: torch.Tensor,
-        new_logprobs: torch.Tensor,
-        advantages: torch.Tensor,
-        importance_weights: torch.Tensor,
-        response_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """PPO clipped surrogate objective with token-importance weighting.
+    # ------------------------------------------------------------------
+    # Core PPO components
+    # ------------------------------------------------------------------
 
-        L_TI-PPO = E[ w(t) * min(r(t)*A(t), clip(r(t), 1-eps, 1+eps)*A(t)) ]
+    @staticmethod
+    def compute_logprobs(logits, labels):
+        """Per-token log probabilities of the chosen actions."""
+        logprobs = F.log_softmax(logits, dim=-1)
+        return torch.gather(logprobs, 2, labels.unsqueeze(-1)).squeeze(-1)
+
+    def compute_gae(self, rewards_per_token, values, mask):
+        """Generalized Advantage Estimation.
+
+        Args:
+            rewards_per_token: (B, T) per-token rewards
+            values: (B, T) value estimates
+            mask: (B, T) valid token mask
+        Returns:
+            advantages: (B, T)
+            returns: (B, T)
         """
-        eps = self.config.clip_epsilon
-        ratio = torch.exp(new_logprobs - old_logprobs)
+        B, T = values.shape
+        gamma = self.config.gamma
+        lam = self.config.lam
 
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * advantages
-        clipped_surr = torch.min(surr1, surr2)
+        advantages = torch.zeros_like(values)
+        last_gae = torch.zeros(B, device=values.device)
 
-        # Apply token importance weighting
-        weighted_surr = importance_weights * clipped_surr
+        for t in reversed(range(T)):
+            next_val = values[:, t + 1] if t + 1 < T else torch.zeros(B, device=values.device)
+            delta = rewards_per_token[:, t] + gamma * next_val - values[:, t]
+            last_gae = delta + gamma * lam * last_gae
+            last_gae = last_gae * mask[:, t]
+            advantages[:, t] = last_gae
 
-        # Mask out padding and average over valid tokens
-        masked = weighted_surr * response_mask
-        loss = -masked.sum() / response_mask.sum().clamp(min=1)
-        return loss
+        returns = advantages + values
+        return advantages, returns
 
-    def weighted_value_loss(
-        self,
-        values: torch.Tensor,
-        returns: torch.Tensor,
-        importance_weights: torch.Tensor,
-        response_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Token-importance weighted value function loss."""
-        vf_loss = (values - returns) ** 2
-        weighted_vf = importance_weights * vf_loss
-        masked = weighted_vf * response_mask
-        return 0.5 * masked.sum() / response_mask.sum().clamp(min=1)
+    def assign_token_rewards(self, scores, response_lens, max_resp_len):
+        """Distribute scalar reward to the last token of each response.
 
-    def triplet_loss(
-        self,
-        anchor_hidden: torch.Tensor,
-        preferred_hidden: torch.Tensor,
-        rejected_hidden: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Triplet loss on sequence representations.
-
-        Pushes model output closer to preferred and farther from rejected.
-        Uses mean-pooled hidden states over valid tokens.
+        Args:
+            scores: list of scalar reward tensors (one per sample)
+            response_lens: list of int response lengths
+            max_resp_len: int, padded response length
+        Returns:
+            rewards_per_token: (B, max_resp_len)
         """
-        # Mean pool over valid token positions
-        mask_f = mask.float().unsqueeze(-1)  # (B, T, 1)
-        anchor_pool = (anchor_hidden * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
-        preferred_pool = (preferred_hidden * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
-        rejected_pool = (rejected_hidden * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
-
-        dist_pos = F.pairwise_distance(anchor_pool, preferred_pool)
-        dist_neg = F.pairwise_distance(anchor_pool, rejected_pool)
-
-        loss = F.relu(dist_pos - dist_neg + self.config.triplet_margin)
-        return loss.mean()
+        B = len(scores)
+        rewards = torch.zeros(B, max_resp_len, device=self.device)
+        for i, (s, rlen) in enumerate(zip(scores, response_lens)):
+            if rlen > 0:
+                rewards[i, rlen - 1] = s.to(self.device)
+        return rewards
 
     @torch.no_grad()
     def get_rewards(self, query_tensors, response_tensors):
@@ -185,7 +155,6 @@ class TIPPOTrainer:
         for q, r in zip(query_tensors, response_tensors):
             full_ids = torch.cat([q, r]).unsqueeze(0).to(self.reward_model.device)
             attn = torch.ones_like(full_ids)
-
             output = self.reward_model(input_ids=full_ids, attention_mask=attn)
             if hasattr(output, "logits"):
                 score = output.logits[0, -1].float()
@@ -194,124 +163,209 @@ class TIPPOTrainer:
             rewards.append(score.cpu())
         return rewards
 
-    def step(self, queries, responses, scores):
-        """Run one TI-PPO step.
+    # ------------------------------------------------------------------
+    # PPO losses
+    # ------------------------------------------------------------------
 
-        This wraps trl's PPOTrainer.step() and applies token-importance
-        weighting to the advantages before the PPO update.
+    def weighted_ppo_loss(self, old_logprobs, new_logprobs, advantages, importance, mask):
+        """PPO clipped surrogate with token-importance weighting."""
+        eps = self.config.clip_epsilon
+        ratio = torch.exp(new_logprobs - old_logprobs)
+
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * advantages
+        clipped = torch.min(surr1, surr2)
+
+        weighted = importance * clipped * mask
+        return -weighted.sum() / mask.sum().clamp(min=1)
+
+    def weighted_value_loss(self, values, returns, importance, mask):
+        """Token-importance weighted value function loss."""
+        vf_loss = (values - returns) ** 2
+        weighted = importance * vf_loss * mask
+        return 0.5 * weighted.sum() / mask.sum().clamp(min=1)
+
+    def kl_penalty(self, new_logprobs, ref_logprobs, mask):
+        """Per-token KL divergence from reference model."""
+        kl = new_logprobs - ref_logprobs  # approximate KL
+        return (kl * mask).sum() / mask.sum().clamp(min=1)
+
+    def triplet_loss(self, anchor_hidden, preferred_hidden, rejected_hidden, mask):
+        """Triplet loss on mean-pooled hidden states."""
+        mask_f = mask.float().unsqueeze(-1)
+        anchor_pool = (anchor_hidden * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
+        preferred_pool = (preferred_hidden * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
+        rejected_pool = (rejected_hidden * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
+
+        dist_pos = F.pairwise_distance(anchor_pool, preferred_pool)
+        dist_neg = F.pairwise_distance(anchor_pool, rejected_pool)
+
+        return F.relu(dist_pos - dist_neg + self.config.triplet_margin).mean()
+
+    # ------------------------------------------------------------------
+    # Main training step
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _collect_rollout(self, query_tensors, response_tensors):
+        """Compute old logprobs, ref logprobs, and values for the rollout."""
+        old_logprobs_list = []
+        ref_logprobs_list = []
+        values_list = []
+
+        for q, r in zip(query_tensors, response_tensors):
+            full = torch.cat([q, r]).unsqueeze(0).to(self.device)
+            resp_start = q.shape[0]
+            resp_len = r.shape[0]
+
+            # Policy model forward
+            logits, vals = self.model(full)
+            lp = self.compute_logprobs(
+                logits[:, resp_start - 1 : resp_start + resp_len - 1],
+                full[:, resp_start : resp_start + resp_len],
+            )
+            old_logprobs_list.append(lp.squeeze(0))
+            values_list.append(vals[:, resp_start : resp_start + resp_len].squeeze(0))
+
+            # Reference model forward
+            ref_out = self.ref_model.pretrained_model(full)
+            ref_logits = ref_out.logits
+            ref_lp = self.compute_logprobs(
+                ref_logits[:, resp_start - 1 : resp_start + resp_len - 1],
+                full[:, resp_start : resp_start + resp_len],
+            )
+            ref_logprobs_list.append(ref_lp.squeeze(0))
+
+        return old_logprobs_list, ref_logprobs_list, values_list
+
+    def _pad_tensors(self, tensor_list, pad_value=0.0):
+        """Pad list of 1D tensors to same length and stack."""
+        max_len = max(t.shape[0] for t in tensor_list)
+        padded = []
+        masks = []
+        for t in tensor_list:
+            pad_len = max_len - t.shape[0]
+            padded.append(F.pad(t, (0, pad_len), value=pad_value))
+            m = torch.ones(max_len, device=t.device)
+            if pad_len > 0:
+                m[-pad_len:] = 0
+            masks.append(m)
+        return torch.stack(padded), torch.stack(masks)
+
+    def step(self, query_tensors, response_tensors, scores):
+        """Run one full TI-PPO update.
 
         Args:
-            queries: list of tokenized query tensors
-            responses: list of tokenized response tensors
+            query_tensors: list of (query_len,) token id tensors
+            response_tensors: list of (resp_len,) token id tensors
             scores: list of scalar reward tensors
+        Returns:
+            stats: dict of training statistics
         """
         self.step_count += 1
+        B = len(query_tensors)
 
-        # Standard PPO step through trl — this handles:
-        # - old logprob computation
-        # - advantage estimation (GAE)
-        # - PPO mini-batch updates
-        # - KL penalty logging
-        stats = self.ppo_trainer.step(queries, responses, scores)
+        # 1. Collect rollout data
+        old_logprobs_list, ref_logprobs_list, values_list = self._collect_rollout(
+            query_tensors, response_tensors
+        )
+        response_lens = [r.shape[0] for r in response_tensors]
 
-        # Compute importance weights for logging and next-step caching
-        if queries and responses:
-            sample_full = torch.cat([queries[0], responses[0]]).unsqueeze(0)
-            sample_mask = torch.ones_like(sample_full)
-            device = next(self.model.parameters()).device
-            sample_full = sample_full.to(device)
-            sample_mask = sample_mask.to(device)
+        # 2. Pad everything to same length
+        old_logprobs, resp_mask = self._pad_tensors(old_logprobs_list)
+        ref_logprobs, _ = self._pad_tensors(ref_logprobs_list)
+        values, _ = self._pad_tensors(values_list)
+        max_resp_len = old_logprobs.shape[1]
 
-            weights = self.compute_importance_weights(sample_full, sample_mask)
-            stats["ti_ppo/mean_importance"] = weights.mean().item()
-            stats["ti_ppo/importance_std"] = weights.std().item()
-            stats["ti_ppo/importance_max"] = weights.max().item()
-            stats["ti_ppo/importance_min"] = weights[weights > 0].min().item() if (weights > 0).any() else 0.0
+        # 3. Build per-token rewards (scalar reward at last response token)
+        rewards_per_token = self.assign_token_rewards(scores, response_lens, max_resp_len)
 
-        return stats
+        # 4. KL penalty as reward shaping
+        kl_per_token = old_logprobs - ref_logprobs
+        rewards_per_token = rewards_per_token - 0.1 * kl_per_token
 
-    def custom_ppo_step(
-        self,
-        query_ids: torch.Tensor,
-        response_ids: torch.Tensor,
-        old_logprobs: torch.Tensor,
-        new_logprobs: torch.Tensor,
-        values: torch.Tensor,
-        returns: torch.Tensor,
-        advantages: torch.Tensor,
-        response_mask: torch.Tensor,
-        preferred_ids: Optional[torch.Tensor] = None,
-        rejected_ids: Optional[torch.Tensor] = None,
-    ) -> dict:
-        """Full custom TI-PPO step with importance-weighted losses and triplet loss.
+        # 5. GAE
+        advantages, returns = self.compute_gae(rewards_per_token, values.detach(), resp_mask)
 
-        Use this instead of `step()` for full control over the training loop.
-        """
-        device = next(self.model.parameters()).device
-        full_ids = torch.cat([query_ids, response_ids], dim=1).to(device)
-        full_mask = torch.ones(full_ids.shape, device=device, dtype=torch.long)
+        # Normalize advantages
+        adv_mean = (advantages * resp_mask).sum() / resp_mask.sum()
+        adv_std = ((advantages - adv_mean).pow(2) * resp_mask).sum() / resp_mask.sum()
+        advantages = (advantages - adv_mean) / (adv_std.sqrt() + 1e-8)
 
-        # 1. Compute token importance
+        # 6. Compute token importance weights
+        # Build full sequences for importance scoring
+        full_ids_list = [
+            torch.cat([q, r]).to(self.device)
+            for q, r in zip(query_tensors, response_tensors)
+        ]
+        full_ids_padded, full_mask = self._pad_tensors(full_ids_list, pad_value=0)
+        full_ids_padded = full_ids_padded.long()
+
         importance = self.compute_importance_weights(
-            full_ids, full_mask, values=values, rewards=returns
+            full_ids_padded, full_mask.long(), values=values.detach(), rewards=rewards_per_token
         )
-        # Slice to response portion only
-        resp_len = response_ids.shape[1]
-        resp_importance = importance[:, -resp_len:]
+        # Slice to response portion
+        resp_importance_list = []
+        for i, q in enumerate(query_tensors):
+            qlen = q.shape[0]
+            rlen = response_lens[i]
+            imp = importance[i, qlen : qlen + rlen]
+            resp_importance_list.append(imp)
+        resp_importance, _ = self._pad_tensors(resp_importance_list, pad_value=0)
 
-        # 2. Weighted PPO policy loss
-        policy_loss = self.weighted_ppo_loss(
-            old_logprobs, new_logprobs, advantages, resp_importance, response_mask
-        )
+        # 7. PPO mini-batch updates
+        total_policy_loss = 0
+        total_value_loss = 0
+        total_kl = 0
 
-        # 3. Weighted value loss
-        value_loss = self.weighted_value_loss(
-            values, returns, resp_importance, response_mask
-        )
+        for epoch in range(self.config.ppo_epochs):
+            # Recompute logprobs and values under current policy
+            new_logprobs_list = []
+            new_values_list = []
+            for q, r in zip(query_tensors, response_tensors):
+                full = torch.cat([q, r]).unsqueeze(0).to(self.device)
+                resp_start = q.shape[0]
+                resp_len = r.shape[0]
 
-        total_loss = policy_loss + self.config.vf_coef * value_loss
+                logits, vals = self.model(full)
+                lp = self.compute_logprobs(
+                    logits[:, resp_start - 1 : resp_start + resp_len - 1],
+                    full[:, resp_start : resp_start + resp_len],
+                )
+                new_logprobs_list.append(lp.squeeze(0))
+                new_values_list.append(vals[:, resp_start : resp_start + resp_len].squeeze(0))
 
-        # 4. Triplet loss (optional)
-        triplet_loss_val = torch.tensor(0.0, device=device)
-        if self.config.use_triplet_loss and preferred_ids is not None and rejected_ids is not None:
-            anchor_out = self.model.pretrained_model(
-                input_ids=full_ids, attention_mask=full_mask, output_hidden_states=True
-            )
-            pref_mask = torch.ones(preferred_ids.shape, device=device, dtype=torch.long)
-            pref_out = self.model.pretrained_model(
-                input_ids=preferred_ids.to(device), attention_mask=pref_mask, output_hidden_states=True
-            )
-            rej_mask = torch.ones(rejected_ids.shape, device=device, dtype=torch.long)
-            rej_out = self.model.pretrained_model(
-                input_ids=rejected_ids.to(device), attention_mask=rej_mask, output_hidden_states=True
-            )
+            new_logprobs, _ = self._pad_tensors(new_logprobs_list)
+            new_values, _ = self._pad_tensors(new_values_list)
 
-            # Use last hidden layer for triplet comparison
-            # Truncate to min length for comparability
-            min_len = min(
-                anchor_out.hidden_states[-1].shape[1],
-                pref_out.hidden_states[-1].shape[1],
-                rej_out.hidden_states[-1].shape[1],
+            # Losses
+            policy_loss = self.weighted_ppo_loss(
+                old_logprobs.detach(), new_logprobs, advantages.detach(),
+                resp_importance.detach(), resp_mask,
             )
-            common_mask = torch.ones(
-                (full_ids.shape[0], min_len), device=device, dtype=torch.long
+            value_loss = self.weighted_value_loss(
+                new_values, returns.detach(), resp_importance.detach(), resp_mask,
             )
-            triplet_loss_val = self.triplet_loss(
-                anchor_out.hidden_states[-1][:, :min_len],
-                pref_out.hidden_states[-1][:, :min_len],
-                rej_out.hidden_states[-1][:, :min_len],
-                common_mask,
-            )
-            total_loss = total_loss + self.config.triplet_gamma * triplet_loss_val
+            kl = self.kl_penalty(new_logprobs, ref_logprobs.detach(), resp_mask)
 
+            loss = policy_loss + self.config.vf_coef * value_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self.optimizer.step()
+
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+            total_kl += kl.item()
+
+        n_epochs = self.config.ppo_epochs
         stats = {
-            "ti_ppo/policy_loss": policy_loss.item(),
-            "ti_ppo/value_loss": value_loss.item(),
-            "ti_ppo/triplet_loss": triplet_loss_val.item(),
-            "ti_ppo/total_loss": total_loss.item(),
-            "ti_ppo/mean_importance": resp_importance.mean().item(),
-            "ti_ppo/importance_std": resp_importance.std().item(),
+            "ppo/policy_loss": total_policy_loss / n_epochs,
+            "ppo/value_loss": total_value_loss / n_epochs,
+            "ppo/mean_kl": total_kl / n_epochs,
+            "ppo/mean_reward": torch.stack(scores).mean().item(),
+            "ti_ppo/mean_importance": resp_importance[resp_mask.bool()].mean().item(),
+            "ti_ppo/importance_std": resp_importance[resp_mask.bool()].std().item(),
         }
-
-        self.step_count += 1
-        return total_loss, stats
+        return stats
