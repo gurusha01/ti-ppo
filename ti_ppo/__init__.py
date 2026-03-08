@@ -10,6 +10,11 @@ from .token_importance import (
     KLGuidedAdvantageImportance,
     AdvantageGaussianImportance,
     EntropyAdvantageImportance,
+    ParetoOptimalImportance,
+    AdaptivePhaseImportance,
+    SNRImportance,
+    EntropyKLLagrangianImportance,
+    AdaptiveIntensityImportance,
 )
 from .trainer import TIPPOTrainer
 from .config import TIPPOConfig

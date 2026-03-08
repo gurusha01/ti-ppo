@@ -302,9 +302,11 @@ class TIPPOTrainer:
 
         if method in PPO_NATIVE_METHODS:
             # PPO-native methods use signals from the rollout itself
-            # Collect response-level logits for entropy-based methods
+            # Collect response-level logits for methods that need them
             resp_logits = None
-            if method in ("entropy", "entropy_advantage"):
+            if method in ("entropy", "entropy_advantage", "adaptive_phase", "snr",
+                          "entropy_kl_lagrangian",
+                          "aiti_entropy", "aiti_adaptive"):
                 resp_logits_list = []
                 with torch.no_grad():
                     for q, r in zip(query_tensors, response_tensors):
@@ -344,6 +346,30 @@ class TIPPOTrainer:
                 resp_ids_padded, _ = self._pad_tensors(resp_ids_list, pad_value=0)
                 scorer_kwargs["input_ids"] = resp_ids_padded.long()
             elif method == "entropy_advantage":
+                scorer_kwargs["logits"] = resp_logits
+                scorer_kwargs["advantages"] = advantages.detach()
+            elif method == "pareto":
+                scorer_kwargs["advantages"] = advantages.detach()
+                scorer_kwargs["old_logprobs"] = old_logprobs.detach()
+                scorer_kwargs["ref_logprobs"] = ref_logprobs.detach()
+            elif method == "adaptive_phase":
+                scorer_kwargs["logits"] = resp_logits
+                scorer_kwargs["advantages"] = advantages.detach()
+            elif method == "snr":
+                scorer_kwargs["logits"] = resp_logits
+                scorer_kwargs["advantages"] = advantages.detach()
+            elif method == "entropy_kl_lagrangian":
+                scorer_kwargs["logits"] = resp_logits
+                scorer_kwargs["old_logprobs"] = old_logprobs.detach()
+                scorer_kwargs["ref_logprobs"] = ref_logprobs.detach()
+            elif method == "aiti_entropy":
+                # AITI wraps entropy → needs logits
+                scorer_kwargs["logits"] = resp_logits
+            elif method == "aiti_advantage":
+                # AITI wraps advantage → needs advantages
+                scorer_kwargs["advantages"] = advantages.detach()
+            elif method == "aiti_adaptive":
+                # AITI wraps adaptive_phase → needs logits + advantages
                 scorer_kwargs["logits"] = resp_logits
                 scorer_kwargs["advantages"] = advantages.detach()
 
