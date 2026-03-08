@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from typing import Optional
 import math
 
-from .token_importance import build_scorer, TokenImportanceScorer
+from .token_importance import build_scorer, TokenImportanceScorer, PPO_NATIVE_METHODS
 from .config import TIPPOConfig
 
 
@@ -298,24 +298,76 @@ class TIPPOTrainer:
         advantages = (advantages - adv_mean) / (adv_std.sqrt() + 1e-8)
 
         # 6. Compute token importance weights
-        # Build full sequences for importance scoring
-        full_ids_list = [
-            torch.cat([q, r]).to(self.device)
-            for q, r in zip(query_tensors, response_tensors)
-        ]
-        full_ids_padded, full_mask = self._pad_tensors(full_ids_list, pad_value=0)
-        full_ids_padded = full_ids_padded.long()
+        method = self.config.importance_method
 
-        if self.config.importance_method == "td_error":
+        if method in PPO_NATIVE_METHODS:
+            # PPO-native methods use signals from the rollout itself
+            # Collect response-level logits for entropy-based methods
+            resp_logits = None
+            if method in ("entropy", "entropy_advantage"):
+                resp_logits_list = []
+                with torch.no_grad():
+                    for q, r in zip(query_tensors, response_tensors):
+                        full = torch.cat([q, r]).unsqueeze(0).to(self.device)
+                        resp_start = q.shape[0]
+                        resp_len_i = r.shape[0]
+                        logits_out, _ = self.model(full)
+                        resp_logits_list.append(
+                            logits_out[0, resp_start:resp_start + resp_len_i]
+                        )
+                # Pad logits to same length
+                max_rlen = max(l.shape[0] for l in resp_logits_list)
+                V = resp_logits_list[0].shape[-1]
+                padded_logits = []
+                for l in resp_logits_list:
+                    pad_len = max_rlen - l.shape[0]
+                    if pad_len > 0:
+                        padded_logits.append(F.pad(l, (0, 0, 0, pad_len)))
+                    else:
+                        padded_logits.append(l)
+                resp_logits = torch.stack(padded_logits)  # (B, T, V)
+
+            # Build kwargs for the scorer
+            scorer_kwargs = dict(attention_mask=resp_mask)
+            if method == "advantage":
+                scorer_kwargs["advantages"] = advantages.detach()
+            elif method == "entropy":
+                scorer_kwargs["logits"] = resp_logits
+            elif method == "kl_guided":
+                scorer_kwargs["advantages"] = advantages.detach()
+                scorer_kwargs["old_logprobs"] = old_logprobs.detach()
+                scorer_kwargs["ref_logprobs"] = ref_logprobs.detach()
+            elif method == "adv_gaussian":
+                scorer_kwargs["advantages"] = advantages.detach()
+                # Need response-level input_ids for Gaussian prior
+                resp_ids_list = [r.to(self.device) for r in response_tensors]
+                resp_ids_padded, _ = self._pad_tensors(resp_ids_list, pad_value=0)
+                scorer_kwargs["input_ids"] = resp_ids_padded.long()
+            elif method == "entropy_advantage":
+                scorer_kwargs["logits"] = resp_logits
+                scorer_kwargs["advantages"] = advantages.detach()
+
+            resp_importance = self.scorer.score(**scorer_kwargs)
+            resp_importance = torch.nan_to_num(resp_importance, nan=1.0, posinf=1.0, neginf=0.0)
+            resp_importance = resp_importance.clamp(0.0, 1.0)
+
+        elif method == "td_error":
             # TD-Error operates on response-level values/rewards directly
             resp_importance = self.compute_importance_weights(
-                old_logprobs.long(), resp_mask.long(),  # dummy ids, won't be used
+                old_logprobs.long(), resp_mask.long(),
                 values=values.detach(), rewards=rewards_per_token,
             )
-            # Ensure shape matches resp_mask
             if resp_importance.shape != resp_mask.shape:
                 resp_importance = resp_importance[:, :resp_mask.shape[1]]
         else:
+            # External methods (hybrid, gradient, attention, uniform)
+            full_ids_list = [
+                torch.cat([q, r]).to(self.device)
+                for q, r in zip(query_tensors, response_tensors)
+            ]
+            full_ids_padded, full_mask = self._pad_tensors(full_ids_list, pad_value=0)
+            full_ids_padded = full_ids_padded.long()
+
             importance = self.compute_importance_weights(
                 full_ids_padded, full_mask.long(),
             )

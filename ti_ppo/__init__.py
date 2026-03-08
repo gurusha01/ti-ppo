@@ -5,6 +5,11 @@ from .token_importance import (
     AttentionImportance,
     TDErrorImportance,
     RewardModelImportance,
+    AdvantageImportance,
+    EntropyImportance,
+    KLGuidedAdvantageImportance,
+    AdvantageGaussianImportance,
+    EntropyAdvantageImportance,
 )
 from .trainer import TIPPOTrainer
 from .config import TIPPOConfig

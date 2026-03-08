@@ -260,6 +260,139 @@ class RewardModelImportance(TokenImportanceScorer):
 
 
 # ---------------------------------------------------------------------------
+# PPO-native importance methods (use signals from the PPO loop itself)
+# These are computed inside the trainer, not via the scorer factory.
+# ---------------------------------------------------------------------------
+
+class AdvantageImportance(TokenImportanceScorer):
+    """Weight tokens by |advantage| magnitude.
+
+    Mathematical justification: In PPO, gradient = E[nabla log pi * A].
+    Tokens with |A| ~ 0 contribute noise, not signal. Weighting by |A|
+    suppresses these, directly reducing gradient variance:
+        Var[w * nabla log pi * A] < Var[nabla log pi * A]
+    when w(t) is small for tokens where A(t) ~ 0.
+
+    This is FREE — we already computed advantages.
+    """
+
+    def __init__(self, temperature: float = 1.0):
+        self.temperature = temperature
+
+    def score(self, advantages, attention_mask=None, **kwargs) -> torch.Tensor:
+        # Softmax over |A| to get normalized importance in (0, 1)
+        abs_adv = advantages.abs()
+        # Temperature-scaled softmax per sequence
+        weights = F.softmax(abs_adv / self.temperature, dim=-1) * abs_adv.shape[-1]
+        # Clamp to [0, 1] after scaling
+        weights = _min_max_normalize(weights, attention_mask)
+        return weights
+
+
+class EntropyImportance(TokenImportanceScorer):
+    """Weight tokens by policy entropy H(pi(.|s_t)).
+
+    High entropy = model is uncertain = critical decision point.
+    These tokens represent the frontier of alignment — where the model
+    could go either way. Focusing optimization here is efficient because
+    low-entropy tokens are already "decided" and hard to move.
+
+    Cost: uses logits already computed in the PPO forward pass.
+    """
+
+    def score(self, logits, attention_mask=None, **kwargs) -> torch.Tensor:
+        # logits: (B, T, V)
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1)  # (B, T)
+        weights = _min_max_normalize(entropy, attention_mask)
+        return weights
+
+
+class KLGuidedAdvantageImportance(TokenImportanceScorer):
+    """Weight by advantage magnitude, downweighted where KL is already high.
+
+    w(t) = |A(t)| * (1 - tanh(beta * |KL(t)|))
+
+    Rationale: tokens where |A| is high but KL is low represent UNTAPPED
+    POTENTIAL — the reward signal says "change here" but the model hasn't
+    diverged yet. Tokens where KL is already high have been addressed.
+    This focuses the remaining optimization budget where it matters most.
+
+    Equivalent to a "remaining value" heuristic: prioritize tokens with
+    the highest (reward signal) / (effort already spent) ratio.
+    """
+
+    def __init__(self, beta: float = 5.0):
+        self.beta = beta
+
+    def score(self, advantages, old_logprobs, ref_logprobs,
+              attention_mask=None, **kwargs) -> torch.Tensor:
+        abs_adv = advantages.abs()
+        kl_per_token = (old_logprobs - ref_logprobs).abs()
+        kl_per_token = torch.nan_to_num(kl_per_token, nan=0.0)
+
+        # High advantage + low KL = high weight
+        unexploited = 1.0 - torch.tanh(self.beta * kl_per_token)
+        raw = abs_adv * unexploited
+
+        weights = _min_max_normalize(raw, attention_mask)
+        return weights
+
+
+class AdvantageGaussianImportance(TokenImportanceScorer):
+    """Advantage magnitude + Gaussian prior (replaces gradient with advantage).
+
+    Same structure as the paper's hybrid method but swaps gradient attribution
+    for |advantage|. This gets the stabilization benefit of the Gaussian prior
+    without the compute cost of gradient attribution.
+
+    W = lambda * normalize(|A|) + (1 - lambda) * Gaussian_prior
+
+    Theoretical motivation: |A| is a better importance signal for PPO than
+    gradient attribution because it directly measures the per-token reward
+    signal, whereas gradient attribution measures prediction sensitivity
+    (which may not correlate with alignment-relevant tokens).
+    """
+
+    def __init__(self, lambda_blend: float = 0.6, sigma_scale: float = 4.0):
+        self.lambda_blend = lambda_blend
+        self.gaussian = GaussianPrior(sigma_scale=sigma_scale)
+
+    def score(self, advantages, input_ids, attention_mask=None, **kwargs) -> torch.Tensor:
+        adv_weights = _min_max_normalize(advantages.abs(), attention_mask)
+        gauss_weights = self.gaussian.score(input_ids=input_ids, attention_mask=attention_mask)
+        return self.lambda_blend * adv_weights + (1 - self.lambda_blend) * gauss_weights
+
+
+class EntropyAdvantageImportance(TokenImportanceScorer):
+    """Product of entropy and |advantage|: focus on uncertain AND high-signal tokens.
+
+    w(t) = normalize(H(t)) * normalize(|A(t)|)
+
+    Only tokens that are BOTH uncertain (high entropy) AND reward-relevant
+    (high |advantage|) get high weight. This is the tightest filter:
+    - High entropy, low advantage → model is confused but it doesn't matter → low weight
+    - Low entropy, high advantage → model is confident, hard to move → low weight
+    - High entropy, high advantage → sweet spot → HIGH weight
+    """
+
+    def score(self, logits, advantages, attention_mask=None, **kwargs) -> torch.Tensor:
+        # Entropy
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1)
+        ent_norm = _min_max_normalize(entropy, attention_mask)
+
+        # Advantage magnitude
+        adv_norm = _min_max_normalize(advantages.abs(), attention_mask)
+
+        # Product — geometric mean of both signals
+        raw = ent_norm * adv_norm
+        return _min_max_normalize(raw, attention_mask)
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -284,6 +417,12 @@ def _min_max_normalize(x: torch.Tensor, mask=None) -> torch.Tensor:
     return out
 
 
+# Methods that require PPO-internal signals (advantages, logits, etc.)
+PPO_NATIVE_METHODS = {
+    "advantage", "entropy", "kl_guided", "adv_gaussian", "entropy_advantage",
+}
+
+
 def build_scorer(config) -> TokenImportanceScorer:
     """Factory to build a scorer from config."""
     method = config.importance_method
@@ -302,6 +441,19 @@ def build_scorer(config) -> TokenImportanceScorer:
         return RewardModelImportance()
     elif method == "uniform":
         return _UniformScorer()
+    elif method == "advantage":
+        return AdvantageImportance(temperature=1.0)
+    elif method == "entropy":
+        return EntropyImportance()
+    elif method == "kl_guided":
+        return KLGuidedAdvantageImportance(beta=5.0)
+    elif method == "adv_gaussian":
+        return AdvantageGaussianImportance(
+            lambda_blend=config.lambda_blend,
+            sigma_scale=config.gaussian_sigma_scale,
+        )
+    elif method == "entropy_advantage":
+        return EntropyAdvantageImportance()
     else:
         raise ValueError(f"Unknown importance method: {method}")
 
