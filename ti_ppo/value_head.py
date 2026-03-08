@@ -12,7 +12,9 @@ class CausalLMWithValueHead(nn.Module):
         super().__init__()
         self.pretrained_model = pretrained_model
         hidden_size = pretrained_model.config.hidden_size
-        self.value_head = nn.Linear(hidden_size, 1, bias=False)
+        # Place value head on same device as the model
+        model_device = next(pretrained_model.parameters()).device
+        self.value_head = nn.Linear(hidden_size, 1, bias=False, device=model_device)
         self.value_head.weight.data.zero_()
 
     @classmethod
@@ -20,10 +22,11 @@ class CausalLMWithValueHead(nn.Module):
         base = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
         return cls(base)
 
-    def forward(self, input_ids, attention_mask=None, **kwargs):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, **kwargs):
         outputs = self.pretrained_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
             output_hidden_states=True,
             **kwargs,
         )
@@ -36,7 +39,7 @@ class CausalLMWithValueHead(nn.Module):
 
     @property
     def device(self):
-        return next(self.parameters()).device
+        return next(self.pretrained_model.parameters()).device
 
     @property
     def config(self):

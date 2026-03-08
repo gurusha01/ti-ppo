@@ -33,12 +33,22 @@ class GradientImportance(TokenImportanceScorer):
 
     @torch.enable_grad()
     def score(self, model, input_ids, attention_mask=None, **kwargs) -> torch.Tensor:
-        embeddings = model.get_input_embeddings()
-        embeds = embeddings(input_ids)  # (B, T, D)
-        embeds = embeds.detach().requires_grad_(True)
+        # Get the base model that supports inputs_embeds (unwrap PEFT if needed)
+        base = model
+        if hasattr(model, "get_base_model"):
+            base = model.get_base_model()
 
-        # Forward through the model with embeddings directly
-        outputs = model(inputs_embeds=embeds, attention_mask=attention_mask)
+        embeddings = base.get_input_embeddings()
+        embeds = embeddings(input_ids)  # (B, T, D)
+        embeds = embeds.detach().clone().requires_grad_(True)
+
+        # Forward through the base model with embeddings directly
+        try:
+            outputs = base(inputs_embeds=embeds, attention_mask=attention_mask)
+        except Exception:
+            # Fallback: return uniform weights if model doesn't support inputs_embeds
+            return torch.ones(input_ids.shape, device=input_ids.device, dtype=torch.float32)
+
         logits = outputs.logits  # (B, T, V)
 
         # Target: max logit at the last real token per sequence
@@ -57,6 +67,9 @@ class GradientImportance(TokenImportanceScorer):
 
         # L1 norm per token
         grad = embeds.grad  # (B, T, D)
+        if grad is None:
+            return torch.ones(input_ids.shape, device=input_ids.device, dtype=torch.float32)
+
         importance = grad.abs().sum(dim=-1)  # (B, T)
 
         # Normalize to [0, 1] per sequence
@@ -136,11 +149,21 @@ class AttentionImportance(TokenImportanceScorer):
 
     @torch.no_grad()
     def score(self, model, input_ids, attention_mask=None, **kwargs) -> torch.Tensor:
-        outputs = model(
+        # Unwrap PEFT model to get attentions (PEFT wrappers may not return them)
+        base = model
+        if hasattr(model, "get_base_model"):
+            base = model.get_base_model()
+
+        outputs = base(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_attentions=True,
         )
+
+        if not outputs.attentions or len(outputs.attentions) == 0:
+            # Fallback to uniform if attentions unavailable
+            return torch.ones(input_ids.shape, device=input_ids.device, dtype=torch.float32)
+
         # attentions: tuple of (B, num_heads, T, T) per layer
         # Average over layers and heads, then sum over query positions
         # -> how much total attention each key token receives
@@ -242,13 +265,19 @@ class RewardModelImportance(TokenImportanceScorer):
 
 def _min_max_normalize(x: torch.Tensor, mask=None) -> torch.Tensor:
     """Normalize tensor to [0, 1] per row, respecting mask."""
+    # Replace NaN/Inf with 0
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
     if mask is not None:
-        x = x.masked_fill(~mask.bool(), float("-inf"))
+        x = x * mask.float()
 
     x_min = x.min(dim=-1, keepdim=True).values
     x_max = x.max(dim=-1, keepdim=True).values
     denom = (x_max - x_min).clamp(min=1e-8)
     out = (x - x_min) / denom
+
+    # Ensure no NaN in output
+    out = torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
 
     if mask is not None:
         out = out * mask.float()

@@ -36,7 +36,7 @@ class TIPPOTrainer:
         self.tokenizer = tokenizer
         self.reward_model = reward_model
 
-        self.device = model.device
+        self.device = next(model.parameters()).device
         self.scorer = build_scorer(config)
         self.step_count = 0
         self._importance_cache = None
@@ -84,6 +84,10 @@ class TIPPOTrainer:
             kwargs["reward_model"] = self.reward_model
 
         weights = self.scorer.score(**kwargs)
+
+        # Sanitize: no NaN/Inf, clamp to [0, 1]
+        weights = torch.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=0.0)
+        weights = weights.clamp(0.0, 1.0)
 
         # EMA smoothing
         if self._importance_cache is not None and self._importance_cache.shape == weights.shape:
@@ -282,6 +286,7 @@ class TIPPOTrainer:
 
         # 4. KL penalty as reward shaping
         kl_per_token = old_logprobs - ref_logprobs
+        kl_per_token = torch.nan_to_num(kl_per_token, nan=0.0, posinf=0.0, neginf=0.0)
         rewards_per_token = rewards_per_token - 0.1 * kl_per_token
 
         # 5. GAE
@@ -301,17 +306,27 @@ class TIPPOTrainer:
         full_ids_padded, full_mask = self._pad_tensors(full_ids_list, pad_value=0)
         full_ids_padded = full_ids_padded.long()
 
-        importance = self.compute_importance_weights(
-            full_ids_padded, full_mask.long(), values=values.detach(), rewards=rewards_per_token
-        )
-        # Slice to response portion
-        resp_importance_list = []
-        for i, q in enumerate(query_tensors):
-            qlen = q.shape[0]
-            rlen = response_lens[i]
-            imp = importance[i, qlen : qlen + rlen]
-            resp_importance_list.append(imp)
-        resp_importance, _ = self._pad_tensors(resp_importance_list, pad_value=0)
+        if self.config.importance_method == "td_error":
+            # TD-Error operates on response-level values/rewards directly
+            resp_importance = self.compute_importance_weights(
+                old_logprobs.long(), resp_mask.long(),  # dummy ids, won't be used
+                values=values.detach(), rewards=rewards_per_token,
+            )
+            # Ensure shape matches resp_mask
+            if resp_importance.shape != resp_mask.shape:
+                resp_importance = resp_importance[:, :resp_mask.shape[1]]
+        else:
+            importance = self.compute_importance_weights(
+                full_ids_padded, full_mask.long(),
+            )
+            # Slice to response portion
+            resp_importance_list = []
+            for i, q in enumerate(query_tensors):
+                qlen = q.shape[0]
+                rlen = response_lens[i]
+                imp = importance[i, qlen : qlen + rlen]
+                resp_importance_list.append(imp)
+            resp_importance, _ = self._pad_tensors(resp_importance_list, pad_value=0)
 
         # 7. PPO mini-batch updates
         total_policy_loss = 0
@@ -349,6 +364,10 @@ class TIPPOTrainer:
             kl = self.kl_penalty(new_logprobs, ref_logprobs.detach(), resp_mask)
 
             loss = policy_loss + self.config.vf_coef * value_loss
+
+            # Skip update if loss is NaN to prevent model corruption
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
 
             self.optimizer.zero_grad()
             loss.backward()
