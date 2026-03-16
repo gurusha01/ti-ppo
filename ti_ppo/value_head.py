@@ -15,9 +15,9 @@ class CausalLMWithValueHead(nn.Module):
         # Place value head on same device and dtype as the model
         model_param = next(pretrained_model.parameters())
         model_device = model_param.device
-        model_dtype = model_param.dtype
+        # Value head always in float32 to avoid NaN from fp16 overflow
         self.value_head = nn.Linear(hidden_size, 1, bias=False,
-                                    device=model_device, dtype=model_dtype)
+                                    device=model_device, dtype=torch.float32)
         self.value_head.weight.data.zero_()
 
     @classmethod

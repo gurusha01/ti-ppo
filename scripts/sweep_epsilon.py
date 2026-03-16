@@ -1,22 +1,31 @@
-"""Benchmark: GSM8K Math Reasoning with TI-PPO.
+"""Sweep MOAI epsilon / EMA decay parameters on GSM8K.
 
-Tests token-importance methods on a real task: grade-school math (GSM8K).
-Unlike synthetic rewards, this uses binary correctness (answer matches ground truth).
+Compares MOAI's adaptive epsilon* (closed-form MSE-optimal) against
+fixed-epsilon variants to demonstrate that adaptive selection is superior.
 
-Methods tested:
-1. PPO baseline (uniform weighting)
-2. AITI-Advantage (linear decay, decay_steps=200)
-3. MOAI-Advantage mono (ema=0.80)
-4. MOAI-Advantage mono (ema=0.90)
+Fixed epsilon = 0.0 corresponds to uniform PPO (no token importance),
+while epsilon = 1.0 applies full importance weighting. Intermediate
+values interpolate between these extremes. MOAI automatically picks
+the optimal epsilon per step using its closed-form formula.
 
-Usage (parallel across GPUs 4-7):
-    python scripts/benchmark_gsm8k.py --method 0 --gpu 4 &
-    python scripts/benchmark_gsm8k.py --method 1 --gpu 5 &
-    python scripts/benchmark_gsm8k.py --method 2 --gpu 6 &
-    python scripts/benchmark_gsm8k.py --method 3 --gpu 7 &
+Configurations:
+    0: Fixed eps=0.0 (uniform PPO)
+    1: Fixed eps=0.1
+    2: Fixed eps=0.2
+    3: Fixed eps=0.3
+    4: Fixed eps=0.5
+    5: Fixed eps=0.7
+    6: Fixed eps=1.0 (full importance)
+    7: MOAI-Adv (adaptive epsilon*)
 
-Or sequential on one GPU:
-    python scripts/benchmark_gsm8k.py --method all --gpu 4
+Usage (parallel across GPUs):
+    python scripts/sweep_epsilon.py --config_idx 0 --gpu 0 --episodes 150 &
+    python scripts/sweep_epsilon.py --config_idx 1 --gpu 1 --episodes 150 &
+    ...
+    python scripts/sweep_epsilon.py --config_idx 7 --gpu 7 --episodes 150 &
+
+Or run all sequentially:
+    python scripts/sweep_epsilon.py --config_idx all --gpu 0 --episodes 150
 """
 
 import json, os, sys, time, math, re, random
@@ -29,35 +38,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ti_ppo import TIPPOConfig, TIPPOTrainer, CausalLMWithValueHead
 
 # -----------------------------------------------------------------------
-# Method definitions
+# Sweep configurations
 # -----------------------------------------------------------------------
 
-METHODS = [
-    # (method, label, extra_config)
-    # GPU 0: baseline
-    ("uniform", "PPO baseline", {}),
-    # GPU 1: AITI-Advantage
-    ("aiti_advantage", "AITI-Advantage", {
-        "aiti_epsilon_max": 1.0, "aiti_decay_steps": 100,
-        "aiti_power": 1.0, "aiti_min_epsilon": 0.0}),
-    # GPU 2: AITI-Entropy
-    ("aiti_entropy", "AITI-Entropy", {
-        "aiti_epsilon_max": 1.0, "aiti_decay_steps": 100,
-        "aiti_power": 1.0, "aiti_min_epsilon": 0.0}),
-    # GPU 3: MOAI-Advantage mono (ema=0.80)
-    ("moai_advantage_mono", "MOAI-Adv mono 0.80", {
+CONFIGS = [
+    # Fixed epsilon (using aiti_advantage with no decay)
+    ("aiti_advantage", "Fixed eps=0.0 (uniform)", {
+        "aiti_epsilon_max": 0.0, "aiti_decay_steps": 99999, "aiti_min_epsilon": 0.0}),
+    ("aiti_advantage", "Fixed eps=0.1", {
+        "aiti_epsilon_max": 0.1, "aiti_decay_steps": 99999, "aiti_min_epsilon": 0.1}),
+    ("aiti_advantage", "Fixed eps=0.2", {
+        "aiti_epsilon_max": 0.2, "aiti_decay_steps": 99999, "aiti_min_epsilon": 0.2}),
+    ("aiti_advantage", "Fixed eps=0.3", {
+        "aiti_epsilon_max": 0.3, "aiti_decay_steps": 99999, "aiti_min_epsilon": 0.3}),
+    ("aiti_advantage", "Fixed eps=0.5", {
+        "aiti_epsilon_max": 0.5, "aiti_decay_steps": 99999, "aiti_min_epsilon": 0.5}),
+    ("aiti_advantage", "Fixed eps=0.7", {
+        "aiti_epsilon_max": 0.7, "aiti_decay_steps": 99999, "aiti_min_epsilon": 0.7}),
+    ("aiti_advantage", "Fixed eps=1.0", {
+        "aiti_epsilon_max": 1.0, "aiti_decay_steps": 99999, "aiti_min_epsilon": 1.0}),
+    # Adaptive MOAI
+    ("moai_advantage_mono", "MOAI-Adv (adaptive)", {
         "moai_ema_decay": 0.80, "moai_warmup_steps": 5}),
-    # GPU 4: MOAI-Advantage mono (ema=0.90)
-    ("moai_advantage_mono", "MOAI-Adv mono 0.90", {
-        "moai_ema_decay": 0.90, "moai_warmup_steps": 5}),
-    # GPU 5: MOAI-Entropy mono (ema=0.80)
-    ("moai_entropy_mono", "MOAI-Ent mono 0.80", {
-        "moai_ema_decay": 0.80, "moai_warmup_steps": 5}),
-    # GPU 6: MOAI-Entropy mono (ema=0.90)
-    ("moai_entropy_mono", "MOAI-Ent mono 0.90", {
-        "moai_ema_decay": 0.90, "moai_warmup_steps": 5}),
-    # GPU 7: raw advantage (no adaptive decay, for comparison)
-    ("advantage", "Advantage (fixed)", {}),
 ]
 
 # -----------------------------------------------------------------------
@@ -74,7 +76,6 @@ def load_gsm8k():
     examples = []
     for row in ds:
         question = row["question"]
-        # GSM8K answers are formatted as "... #### <number>"
         answer_text = row["answer"]
         numeric_answer = extract_gsm8k_answer(answer_text)
         if numeric_answer is not None:
@@ -88,10 +89,7 @@ def load_gsm8k():
 
 
 def extract_gsm8k_answer(text):
-    """Extract the numeric answer from GSM8K format '#### <number>'.
-
-    Handles integers and decimals, with optional commas (e.g., 1,234).
-    """
+    """Extract the numeric answer from GSM8K format '#### <number>'."""
     match = re.search(r"####\s*([\-\d,\.]+)", text)
     if match:
         num_str = match.group(1).replace(",", "")
@@ -105,10 +103,9 @@ def extract_gsm8k_answer(text):
 def extract_model_answer(response):
     """Extract the final numeric answer from the model's response.
 
-    Tries patterns in priority order — structured formats first,
-    then natural language, then fallback to last number.
+    Tries patterns in priority order: boxed, ####, natural language, = X, last number.
     """
-    # Pattern 1: \boxed{number} (our prompt asks for this)
+    # Pattern 1: \boxed{number}
     matches = re.findall(r"\\boxed\{([\-\d,\.]+)\}", response)
     if matches:
         try:
@@ -116,7 +113,7 @@ def extract_model_answer(response):
         except ValueError:
             pass
 
-    # Pattern 2: GSM8K format #### number
+    # Pattern 2: #### number
     match = re.search(r"####\s*([\-\d,\.]+)", response)
     if match:
         try:
@@ -140,7 +137,7 @@ def extract_model_answer(response):
         except ValueError:
             pass
 
-    # Pattern 5: Last standalone number (fallback — can be noisy)
+    # Pattern 5: Last standalone number (fallback)
     numbers = re.findall(r"(?<!\w)([\-]?\d[\d,]*\.?\d*)", response)
     if numbers:
         try:
@@ -152,15 +149,11 @@ def extract_model_answer(response):
 
 
 def gsm8k_reward(response, ground_truth_answer):
-    """Binary reward: +1.0 if correct, -1.0 if incorrect.
-
-    Comparison uses approximate equality for floating point.
-    """
+    """Binary reward: +1.0 if correct, -1.0 if incorrect."""
     predicted = extract_model_answer(response)
     if predicted is None:
         return -1.0
 
-    # Approximate equality: within 0.01 or within 0.1% relative
     if abs(predicted - ground_truth_answer) < 0.01:
         return 1.0
     if ground_truth_answer != 0 and abs(predicted - ground_truth_answer) / abs(ground_truth_answer) < 0.001:
@@ -170,7 +163,8 @@ def gsm8k_reward(response, ground_truth_answer):
 
 
 def format_prompt(question, tokenizer=None):
-    """Format a GSM8K question using the model's chat template."""
+    """Format a GSM8K question as a prompt for the model."""
+    # Old prompt
     if tokenizer is not None and hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template:
         messages = [{"role": "user", "content": f"Solve this math problem step by step. Put your final answer in \\boxed{{}}.\n\n{question}"}]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -188,7 +182,7 @@ FALLBACK_MODEL = "Qwen/Qwen2.5-0.5B"
 def load_model_and_tokenizer(device):
     """Load model + LoRA + ValueHead and reference model.
 
-    Tries Qwen2.5-0.5B first. Falls back to GPT-2 if that fails.
+    Tries Qwen2.5-1.5B-Instruct first. Falls back to Qwen2.5-0.5B.
     Returns (model, ref_model, tokenizer, model_name, lora_target_modules).
     """
     for model_name, lora_targets in [
@@ -226,38 +220,27 @@ def load_model_and_tokenizer(device):
             print(f"Failed to load {model_name}: {e}")
             if model_name == FALLBACK_MODEL:
                 raise RuntimeError("Could not load any model") from e
-            print("Falling back to GPT-2...")
+            print("Falling back...")
             continue
 
 
 # -----------------------------------------------------------------------
-# Training loop for a single method
+# Training loop for a single configuration
 # -----------------------------------------------------------------------
 
-def run_method(method, label, extra_config, tokenizer, gsm8k_data,
-               device, model_name, lora_targets, episodes=300):
-    """Run a single TI-PPO method on GSM8K.
+def run_config(method, label, extra_config, tokenizer, gsm8k_data,
+               device, model_name, lora_targets, episodes=150):
+    """Run a single epsilon configuration on GSM8K.
 
-    Args:
-        method: importance method name
-        label: human-readable label
-        extra_config: dict of extra config overrides
-        tokenizer: tokenizer
-        gsm8k_data: list of GSM8K examples
-        device: torch device
-        model_name: which model to load
-        lora_targets: LoRA target modules
-        episodes: number of training episodes
-
-    Returns:
-        (result_dict, history_dict)
+    Returns (result_dict, history_dict).
     """
     print(f"\n{'='*70}")
     print(f"  {label}")
     print(f"  method={method} | model={model_name} | episodes={episodes}")
+    print(f"  extra_config={extra_config}")
     print(f"{'='*70}")
 
-    # Load fresh model for this method
+    # Load fresh model
     model = CausalLMWithValueHead.from_pretrained(
         model_name, dtype=torch.float16, device_map={"": device},
         trust_remote_code=True,
@@ -304,8 +287,8 @@ def run_method(method, label, extra_config, tokenizer, gsm8k_data,
         "pad_token_id": tokenizer.pad_token_id,
     }
 
-    # Pre-tokenize a pool of prompts (use up to 1000 for variety)
-    pool_size = len(gsm8k_data)  # use full training set to avoid overfitting
+    # Pre-tokenize a pool of prompts
+    pool_size = len(gsm8k_data)  # use full training set
     pool_indices = list(range(pool_size))
     prompt_cache = {}
 
@@ -430,6 +413,7 @@ def run_method(method, label, extra_config, tokenizer, gsm8k_data,
         "label": label,
         "method": method,
         "model": model_name,
+        "extra_config": extra_config,
         "episodes": n,
         "time": round(elapsed, 1),
         "reward_q1": round(quartile_mean(history["rewards"], 0), 4),
@@ -471,26 +455,26 @@ def run_method(method, label, extra_config, tokenizer, gsm8k_data,
 
 
 # -----------------------------------------------------------------------
-# Main
+# Results printing
 # -----------------------------------------------------------------------
 
 def print_results_table(results):
-    """Print a formatted results table."""
-    baseline = next((r for r in results if r["method"] == "uniform"), None)
+    """Print a formatted results table for the epsilon sweep."""
+    uniform = next((r for r in results if "eps=0.0" in r["label"]), None)
 
     print(f"\n\n{'='*130}")
-    print(f"{'GSM8K BENCHMARK RESULTS — TI-PPO TOKEN IMPORTANCE METHODS':^130}")
+    print(f"{'EPSILON SWEEP RESULTS — MOAI ADAPTIVE vs FIXED EPSILON':^130}")
     print(f"{'='*130}")
-    print(f"{'Method':<30} {'R(Q1)':<8} {'R(Q4)':<8} {'dR':<8} "
+    print(f"{'Config':<28} {'R(Q1)':<8} {'R(Q4)':<8} {'dR':<8} "
           f"{'Acc(Q1)':<8} {'Acc(Q4)':<8} {'FinalAcc':<9} "
-          f"{'KL(Q4)':<9} {'KL-Eff':<8} {'Vol':<7} {'vs PPO':<8} {'Time':<7}")
+          f"{'KL(Q4)':<9} {'KL-Eff':<8} {'Vol':<7} {'vs Uni':<8} {'Time':<7}")
     print(f"{'-'*130}")
 
     for r in sorted(results, key=lambda x: x["accuracy_q4"], reverse=True):
-        vs_ppo = (r["accuracy_q4"] - baseline["accuracy_q4"]) if baseline else 0
+        vs_uniform = (r["accuracy_q4"] - uniform["accuracy_q4"]) if uniform else 0
         kl_eff = f"{r['kl_efficiency']:.1f}" if r['kl_efficiency'] != float('inf') else "inf"
         print(
-            f"{r['label']:<30} "
+            f"{r['label']:<28} "
             f"{r['reward_q1']:<8.4f} "
             f"{r['reward_q4']:<8.4f} "
             f"{'+' if r['reward_improvement']>=0 else ''}{r['reward_improvement']:<7.4f} "
@@ -500,7 +484,7 @@ def print_results_table(results):
             f"{r['kl_q4']:<9.4f} "
             f"{kl_eff:<8} "
             f"{r['reward_volatility']:<7.4f} "
-            f"{'+' if vs_ppo>=0 else ''}{vs_ppo:<7.4f} "
+            f"{'+' if vs_uniform>=0 else ''}{vs_uniform:<7.4f} "
             f"{r['time']:<7.0f}"
         )
     print(f"{'='*130}")
@@ -517,19 +501,24 @@ def print_results_table(results):
                 dominated_by.append(r2["label"])
         status = ("*** PARETO-OPTIMAL ***" if not dominated_by
                   else f"dominated by: {', '.join(dominated_by[:3])}")
-        print(f"  {r['label']:<30} Acc={r['accuracy_q4']:.4f}  "
+        print(f"  {r['label']:<28} Acc={r['accuracy_q4']:.4f}  "
               f"|KL|={abs(r['kl_q4']):.4f}  -> {status}")
 
 
+# -----------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="GSM8K TI-PPO Benchmark")
-    parser.add_argument("--episodes", type=int, default=150,
-                        help="Number of training episodes per method")
-    parser.add_argument("--gpu", type=int, default=4,
+    parser = argparse.ArgumentParser(
+        description="Sweep epsilon on GSM8K: MOAI adaptive vs fixed epsilon")
+    parser.add_argument("--config_idx", type=str, default="0",
+                        help="Config index (0-7) or 'all' to run all sequentially")
+    parser.add_argument("--gpu", type=int, default=0,
                         help="GPU index to use")
-    parser.add_argument("--method", type=str, default="all",
-                        help="Method index (0-3) or 'all' to run all sequentially")
+    parser.add_argument("--episodes", type=int, default=150,
+                        help="Number of training episodes per config")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     args = parser.parse_args()
@@ -539,8 +528,9 @@ def main():
     torch.manual_seed(args.seed)
 
     device = torch.device(f"cuda:{args.gpu}")
-    print(f"=== GSM8K TI-PPO Benchmark ===")
+    print(f"=== Epsilon Sweep: MOAI Adaptive vs Fixed Epsilon ===")
     print(f"Episodes: {args.episodes} | GPU: {device} | Seed: {args.seed}")
+    print(f"Total configs: {len(CONFIGS)}")
 
     # Load dataset
     gsm8k_data = load_gsm8k()
@@ -548,58 +538,58 @@ def main():
     # Probe which model works on this GPU
     print(f"\nProbing model availability...")
     model, ref_model, tokenizer, model_name, lora_targets = load_model_and_tokenizer(device)
-    # Free the probe models; each method loads its own fresh copy
     del model, ref_model
     torch.cuda.empty_cache()
 
-    # Determine which methods to run
-    if args.method == "all":
-        methods_to_run = list(enumerate(METHODS))
+    # Determine which configs to run
+    if args.config_idx == "all":
+        configs_to_run = list(enumerate(CONFIGS))
     else:
-        idx = int(args.method)
-        if idx < 0 or idx >= len(METHODS):
-            print(f"Error: method index {idx} out of range [0, {len(METHODS)-1}]")
+        idx = int(args.config_idx)
+        if idx < 0 or idx >= len(CONFIGS):
+            print(f"Error: config_idx {idx} out of range [0, {len(CONFIGS)-1}]")
             sys.exit(1)
-        methods_to_run = [(idx, METHODS[idx])]
+        configs_to_run = [(idx, CONFIGS[idx])]
 
-    print(f"Methods to run: {len(methods_to_run)}")
-    for i, (method, label, _) in methods_to_run:
-        print(f"  [{i}] {label} ({method})")
+    print(f"\nConfigs to run: {len(configs_to_run)}")
+    for i, (method, label, extra) in configs_to_run:
+        print(f"  [{i}] {label} ({method}) {extra}")
     print()
 
     results = []
     histories = {}
 
-    for i, (method, label, extra) in methods_to_run:
-        r, h = run_method(
+    for i, (method, label, extra) in configs_to_run:
+        # Reset seed before each config for fair comparison
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+        r, h = run_config(
             method, label, extra, tokenizer, gsm8k_data,
             device, model_name, lora_targets, args.episodes,
         )
         results.append(r)
         histories[label] = h
 
-        # Save intermediate results after each method
-        method_tag = f"{i}_{method}"
-        out_path = os.path.join(
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "benchmark"),
-            f"benchmark_gsm8k_results_{method_tag}.json",
-        )
+        # Save results for this config
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out_path = os.path.join(base_dir, f"logs/sweep_epsilon/sweep_epsilon_results_{i}.json")
         with open(out_path, "w") as f:
             json.dump(
-                {"results": [r], "history": h, "config": {
-                    "episodes": args.episodes, "gpu": args.gpu,
-                    "seed": args.seed, "model": model_name,
+                {"result": r, "history": h, "config": {
+                    "config_idx": i, "episodes": args.episodes,
+                    "gpu": args.gpu, "seed": args.seed, "model": model_name,
                 }},
                 f, indent=2,
                 default=lambda x: None if x == float('inf') else x,
             )
         print(f"  Saved to {out_path}")
 
-    # Print combined results table if we ran multiple methods
+    # Print combined results table if we ran multiple configs
     if len(results) > 1:
         print_results_table(results)
 
-        # Epsilon trajectory for AITI/MOAI methods
+        # Epsilon trajectory for MOAI
         print(f"\n--- Epsilon Trajectory (quartile averages) ---")
         for label, h in histories.items():
             eps_list = h.get("epsilon", [])
@@ -629,21 +619,19 @@ def main():
                         parts.append(f"Q{qi+1}={acc_avg:.4f}")
                 print(f"  {label}: {' -> '.join(parts)}")
 
-    # Save combined results
-    combined_path = os.path.join(
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "benchmark"),
-        "benchmark_gsm8k_results_combined.json",
-    )
-    with open(combined_path, "w") as f:
-        json.dump(
-            {"results": results, "histories": histories, "config": {
-                "episodes": args.episodes, "gpu": args.gpu,
-                "seed": args.seed, "model": model_name,
-            }},
-            f, indent=2,
-            default=lambda x: None if x == float('inf') else x,
-        )
-    print(f"\nCombined results saved to {combined_path}")
+        # Save combined results
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        combined_path = os.path.join(base_dir, "logs/sweep_epsilon/sweep_epsilon_results_combined.json")
+        with open(combined_path, "w") as f:
+            json.dump(
+                {"results": results, "histories": histories, "config": {
+                    "episodes": args.episodes, "gpu": args.gpu,
+                    "seed": args.seed, "model": model_name,
+                }},
+                f, indent=2,
+                default=lambda x: None if x == float('inf') else x,
+            )
+        print(f"\nCombined results saved to {combined_path}")
 
 
 if __name__ == "__main__":

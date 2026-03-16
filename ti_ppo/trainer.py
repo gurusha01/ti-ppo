@@ -41,10 +41,11 @@ class TIPPOTrainer:
         self.step_count = 0
         self._importance_cache = None
 
-        # Optimizer: only train policy model params
+        # Optimizer: only train trainable (e.g. LoRA + value head) params
         if optimizer is None:
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
             self.optimizer = torch.optim.AdamW(
-                model.parameters(), lr=config.learning_rate
+                trainable_params, lr=config.learning_rate
             )
         else:
             self.optimizer = optimizer
@@ -103,8 +104,11 @@ class TIPPOTrainer:
 
     @staticmethod
     def compute_logprobs(logits, labels):
-        """Per-token log probabilities of the chosen actions."""
-        logprobs = F.log_softmax(logits, dim=-1)
+        """Per-token log probabilities of the chosen actions.
+
+        Upcasts to float32 to avoid fp16 underflow in logprob differences.
+        """
+        logprobs = F.log_softmax(logits.float(), dim=-1)
         return torch.gather(logprobs, 2, labels.unsqueeze(-1)).squeeze(-1)
 
     def compute_gae(self, rewards_per_token, values, mask):
