@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from typing import Optional
 import math
 
-from .token_importance import build_scorer, TokenImportanceScorer, PPO_NATIVE_METHODS
+from .token_importance import build_scorer, TokenImportanceScorer, PPO_NATIVE_METHODS, MSEOptimalImportance
 from .config import TIPPOConfig
 
 
@@ -171,7 +171,8 @@ class TIPPOTrainer:
     # PPO losses
     # ------------------------------------------------------------------
 
-    def weighted_ppo_loss(self, old_logprobs, new_logprobs, advantages, importance, mask):
+    def weighted_ppo_loss(self, old_logprobs, new_logprobs, advantages, importance, mask,
+                          return_per_token=False):
         """PPO clipped surrogate with token-importance weighting."""
         eps = self.config.clip_epsilon
         ratio = torch.exp(new_logprobs - old_logprobs)
@@ -181,7 +182,10 @@ class TIPPOTrainer:
         clipped = torch.min(surr1, surr2)
 
         weighted = importance * clipped * mask
-        return -weighted.sum() / mask.sum().clamp(min=1)
+        loss = -weighted.sum() / mask.sum().clamp(min=1)
+        if return_per_token:
+            return loss, clipped.detach()  # clipped = per-token f(t)
+        return loss
 
     def weighted_value_loss(self, values, returns, importance, mask):
         """Token-importance weighted value function loss."""
@@ -306,7 +310,8 @@ class TIPPOTrainer:
             resp_logits = None
             if method in ("entropy", "entropy_advantage", "adaptive_phase", "snr",
                           "entropy_kl_lagrangian",
-                          "aiti_entropy", "aiti_adaptive"):
+                          "aiti_entropy", "aiti_adaptive", "moai_entropy",
+                          "moai_entropy_mono"):
                 resp_logits_list = []
                 with torch.no_grad():
                     for q, r in zip(query_tensors, response_tensors):
@@ -372,6 +377,12 @@ class TIPPOTrainer:
                 # AITI wraps adaptive_phase → needs logits + advantages
                 scorer_kwargs["logits"] = resp_logits
                 scorer_kwargs["advantages"] = advantages.detach()
+            elif method in ("moai_advantage", "moai_advantage_mono"):
+                # MOAI wraps advantage → needs advantages
+                scorer_kwargs["advantages"] = advantages.detach()
+            elif method in ("moai_entropy", "moai_entropy_mono"):
+                # MOAI wraps entropy → needs logits
+                scorer_kwargs["logits"] = resp_logits
 
             resp_importance = self.scorer.score(**scorer_kwargs)
             resp_importance = torch.nan_to_num(resp_importance, nan=1.0, posinf=1.0, neginf=0.0)
@@ -432,10 +443,17 @@ class TIPPOTrainer:
             new_values, _ = self._pad_tensors(new_values_list)
 
             # Losses
-            policy_loss = self.weighted_ppo_loss(
-                old_logprobs.detach(), new_logprobs, advantages.detach(),
-                resp_importance.detach(), resp_mask,
-            )
+            is_moai = isinstance(self.scorer, MSEOptimalImportance)
+            if is_moai:
+                policy_loss, per_token_loss = self.weighted_ppo_loss(
+                    old_logprobs.detach(), new_logprobs, advantages.detach(),
+                    resp_importance.detach(), resp_mask, return_per_token=True,
+                )
+            else:
+                policy_loss = self.weighted_ppo_loss(
+                    old_logprobs.detach(), new_logprobs, advantages.detach(),
+                    resp_importance.detach(), resp_mask,
+                )
             value_loss = self.weighted_value_loss(
                 new_values, returns.detach(), resp_importance.detach(), resp_mask,
             )
@@ -452,6 +470,15 @@ class TIPPOTrainer:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
 
+            # Update MOAI statistics with per-token loss from first epoch
+            if is_moai and epoch == 0:
+                raw_scores = self.scorer.inner_scorer.score(
+                    **{k: v for k, v in scorer_kwargs.items()
+                       if k != 'attention_mask'},
+                    attention_mask=resp_mask,
+                )
+                self.scorer.update_statistics(raw_scores, per_token_loss, resp_mask)
+
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
             total_kl += kl.item()
@@ -465,4 +492,12 @@ class TIPPOTrainer:
             "ti_ppo/mean_importance": resp_importance[resp_mask.bool()].mean().item(),
             "ti_ppo/importance_std": resp_importance[resp_mask.bool()].std().item(),
         }
+
+        # MOAI-specific logging
+        if isinstance(self.scorer, MSEOptimalImportance):
+            stats["moai/epsilon"] = self.scorer.epsilon
+            stats["moai/C"] = self.scorer._last_C
+            stats["moai/rho"] = self.scorer._last_rho
+            stats["moai/tau2"] = self.scorer._last_tau2
+
         return stats

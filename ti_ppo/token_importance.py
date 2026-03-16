@@ -672,11 +672,182 @@ class AdaptiveIntensityImportance(TokenImportanceScorer):
         return weights
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: MSE-Optimal Adaptive Intensity (MOAI) — closed-form optimal ε
+# ---------------------------------------------------------------------------
+
+class MSEOptimalImportance(TokenImportanceScorer):
+    """MSE-Optimal Adaptive Intensity (MOAI).
+
+    NOVEL CONTRIBUTION: Instead of decaying ε on a hand-tuned schedule (AITI),
+    derive the MSE-optimal ε* at each step from online gradient statistics.
+
+    For the affine interpolation w = 1 + ε(s - 1) where E[s] ≈ 1:
+      - Bias(ε) = ε · C,  where C = Cov(s, f)
+      - Var(ε)  = σ² + 2ε·ρ + ε²·τ²
+        where σ² = Var(f), ρ = Cov(f, (s-1)·f), τ² = Var((s-1)·f)
+
+    MSE(ε) = ε²C² + (1/T)(σ² + 2ερ + ε²τ²)
+
+    Setting dMSE/dε = 0 gives the closed-form optimum:
+        ε* = -ρ / (T·C² + τ²)
+
+    Key properties:
+    1. ε* is data-adaptive — no decay_steps hyperparameter
+    2. ε* depends on T (token count) — longer sequences need less weighting
+    3. ε* naturally decreases as Cov(s,f) grows during training
+    4. This is provably the MSE-minimizing intensity at each step
+
+    Prior art comparison:
+    - Korba & Portier (2022) use cross-validation to choose α in w^α
+    - Hachiya et al. (2009) use importance-weighted cross-validation
+    - MOAI has a CLOSED-FORM solution from MSE minimization — no CV needed
+    """
+
+    def __init__(self, inner_scorer: TokenImportanceScorer,
+                 ema_decay: float = 0.95, min_epsilon: float = 0.0,
+                 max_epsilon: float = 1.0, warmup_steps: int = 5,
+                 monotone: bool = False):
+        self.inner_scorer = inner_scorer
+        self.ema_decay = ema_decay
+        self.min_epsilon = min_epsilon
+        self.max_epsilon = max_epsilon
+        self.warmup_steps = warmup_steps
+        self.monotone = monotone
+        self.step_count = 0
+
+        # EMA statistics for the MSE-optimal formula
+        self._ema_C = 0.0       # Cov(s, f)
+        self._ema_rho = 0.0     # Cov(f, (s-1)·f)
+        self._ema_tau2 = 0.0    # Var((s-1)·f)
+        self._ema_sigma2 = 0.0  # Var(f)
+        self._eps_ceiling = max_epsilon  # For monotone constraint
+
+        # For logging
+        self._last_epsilon = 1.0
+        self._last_C = 0.0
+        self._last_rho = 0.0
+        self._last_tau2 = 0.0
+
+    @property
+    def epsilon(self):
+        return self._last_epsilon
+
+    def _update_ema(self, name, value):
+        """Update exponential moving average."""
+        attr = f"_ema_{name}"
+        old = getattr(self, attr)
+        new = self.ema_decay * old + (1.0 - self.ema_decay) * value
+        setattr(self, attr, new)
+        return new
+
+    def _compute_optimal_epsilon(self, T: int) -> float:
+        """Compute ε* = -ρ / (T·C² + τ²) with safety bounds."""
+        C = self._ema_C
+        rho = self._ema_rho
+        tau2 = max(self._ema_tau2, 1e-10)
+
+        denominator = T * C * C + tau2
+        if abs(denominator) < 1e-12:
+            return self._eps_ceiling if self.monotone else self.max_epsilon
+
+        eps_star = -rho / denominator
+        eps_star = float(max(self.min_epsilon, min(self.max_epsilon, eps_star)))
+
+        # Monotone constraint: ε can only decrease over time
+        if self.monotone:
+            eps_star = min(eps_star, self._eps_ceiling)
+            self._eps_ceiling = eps_star
+
+        return eps_star
+
+    def score(self, attention_mask=None, **kwargs) -> torch.Tensor:
+        self.step_count += 1
+
+        # Get raw importance scores from inner scorer
+        raw_scores = self.inner_scorer.score(attention_mask=attention_mask, **kwargs)
+
+        # During warmup, use full weighting to collect statistics
+        if self.step_count <= self.warmup_steps:
+            eps = self.max_epsilon
+        else:
+            # Compute optimal epsilon from EMA statistics
+            if attention_mask is not None:
+                T = attention_mask.float().sum().item()
+            else:
+                T = float(raw_scores.numel())
+            eps = self._compute_optimal_epsilon(T)
+
+        self._last_epsilon = eps
+
+        # Apply interpolation: w = 1 + ε(s - 1) = (1-ε)·1 + ε·s
+        if attention_mask is not None:
+            uniform = attention_mask.float()
+        else:
+            uniform = torch.ones_like(raw_scores)
+
+        weights = (1.0 - eps) * uniform + eps * raw_scores
+        return weights
+
+    def update_statistics(self, importance_scores, ppo_loss_per_token, mask):
+        """Update EMA statistics from the current batch.
+
+        Call this AFTER the PPO loss is computed with the current weights.
+
+        Args:
+            importance_scores: s(t), the raw importance scores (before ε mixing)
+            ppo_loss_per_token: f(t) = min(r_t·A_t, clip(r_t)·A_t) per token
+            mask: attention mask for valid tokens
+        """
+        with torch.no_grad():
+            m = mask.float()
+            valid = m.sum().clamp(min=1)
+
+            s = importance_scores
+            f = ppo_loss_per_token
+
+            # Compute s-1 (deviation from uniform)
+            s_dev = (s - 1.0) * m
+
+            # Masked means
+            s_mean = (s * m).sum() / valid
+            f_mean = (f * m).sum() / valid
+            sf_product = s_dev * f  # (s-1) * f
+            sf_mean = (sf_product * m).sum() / valid
+
+            # Cov(s, f) = E[s·f] - E[s]·E[f]
+            C = ((s * f * m).sum() / valid - s_mean * f_mean).item()
+
+            # Cov(f, (s-1)·f) = E[f·(s-1)·f] - E[f]·E[(s-1)·f]
+            # = E[(s-1)·f²] - E[f]·E[(s-1)·f]
+            f_sq = f * f
+            rho = ((s_dev * f_sq * m).sum() / valid - f_mean * sf_mean).item()
+
+            # Var((s-1)·f) = E[((s-1)·f)²] - E[(s-1)·f]²
+            tau2 = ((sf_product ** 2 * m).sum() / valid - sf_mean ** 2).item()
+
+            # Var(f)
+            sigma2 = ((f ** 2 * m).sum() / valid - f_mean ** 2).item()
+
+            # Update EMAs
+            self._update_ema("C", C)
+            self._update_ema("rho", rho)
+            self._update_ema("tau2", tau2)
+            self._update_ema("sigma2", sigma2)
+
+            # Store for logging
+            self._last_C = self._ema_C
+            self._last_rho = self._ema_rho
+            self._last_tau2 = self._ema_tau2
+
+
 # Methods that require PPO-internal signals (advantages, logits, etc.)
 PPO_NATIVE_METHODS = {
     "advantage", "entropy", "kl_guided", "adv_gaussian", "entropy_advantage",
     "pareto", "adaptive_phase", "snr", "entropy_kl_lagrangian",
     "aiti_entropy", "aiti_advantage", "aiti_adaptive",
+    "moai_advantage", "moai_entropy",
+    "moai_advantage_mono", "moai_entropy_mono",
 }
 
 
@@ -754,6 +925,32 @@ def build_scorer(config) -> TokenImportanceScorer:
             decay_steps=getattr(config, 'aiti_decay_steps', 100),
             power=getattr(config, 'aiti_power', 1.0),
             min_epsilon=getattr(config, 'aiti_min_epsilon', 0.0),
+        )
+    elif method == "moai_advantage":
+        return MSEOptimalImportance(
+            inner_scorer=AdvantageImportance(temperature=1.0),
+            ema_decay=getattr(config, 'moai_ema_decay', 0.95),
+            warmup_steps=getattr(config, 'moai_warmup_steps', 5),
+        )
+    elif method == "moai_entropy":
+        return MSEOptimalImportance(
+            inner_scorer=EntropyImportance(),
+            ema_decay=getattr(config, 'moai_ema_decay', 0.95),
+            warmup_steps=getattr(config, 'moai_warmup_steps', 5),
+        )
+    elif method == "moai_advantage_mono":
+        return MSEOptimalImportance(
+            inner_scorer=AdvantageImportance(temperature=1.0),
+            ema_decay=getattr(config, 'moai_ema_decay', 0.95),
+            warmup_steps=getattr(config, 'moai_warmup_steps', 5),
+            monotone=True,
+        )
+    elif method == "moai_entropy_mono":
+        return MSEOptimalImportance(
+            inner_scorer=EntropyImportance(),
+            ema_decay=getattr(config, 'moai_ema_decay', 0.95),
+            warmup_steps=getattr(config, 'moai_warmup_steps', 5),
+            monotone=True,
         )
     else:
         raise ValueError(f"Unknown importance method: {method}")

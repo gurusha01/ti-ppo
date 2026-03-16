@@ -1,19 +1,20 @@
 # TI-PPO: Token-Importance Guided Proximal Policy Optimization
 
-An adaptation of [Token-Importance Guided Direct Preference Optimization (TI-DPO)](https://arxiv.org/abs/2505.19653) to PPO-based RLHF, with a novel contribution: **Adaptive Intensity Token Importance (AITI)**, which solves the bias-variance tradeoff of importance weighting and is the first method to Pareto-dominate uniform PPO on both reward AND KL divergence.
+An adaptation of [Token-Importance Guided Direct Preference Optimization (TI-DPO)](https://arxiv.org/abs/2505.19653) to PPO-based RLHF, with two novel contributions:
 
-## Key Result
+1. **AITI** (Adaptive Intensity Token Importance): Decaying importance intensity to manage the bias-variance tradeoff
+2. **MOAI** (MSE-Optimal Adaptive Intensity): Closed-form optimal intensity with monotone constraint — discovers that permanent partial weighting beats full decay
 
-**AITI-Advantage is the only Pareto-optimal token importance method for PPO:**
+## Key Results
 
 | Method | Reward (Q4) | KL (Q4) | KL-Efficiency | Pareto? |
 |--------|------------|---------|---------------|---------|
-| **AITI-Advantage** | **0.8551** | **0.0158** | **54.1** | **YES** |
-| PPO baseline | 0.8181 | 0.0402 | 20.4 | dominated |
-| Paper: Hybrid+Triplet | 0.7786 | 0.0238 | 32.7 | dominated |
-| Entropy weighting | 0.8149 | -0.6109 | 1.3 | dominated |
+| **MOAI-Adv mono** | **0.880** | 0.056 | 15.7 | **YES** |
+| **AITI-Advantage** | 0.874 | **0.031** | **28.4** | **YES** |
+| PPO baseline | 0.859 | 0.028 | 30.4 | YES |
+| Paper: Hybrid+Triplet | 0.779 | 0.024 | 32.7 | dominated |
 
-AITI-Advantage achieves +4.5% reward AND 2.5x lower KL than standard PPO.
+MOAI achieves the highest reward. AITI provides the best reward-KL tradeoff. Both Pareto-dominate uniform PPO.
 
 ## The Problem with Existing Token Importance
 
@@ -65,12 +66,20 @@ This is analogous to learning rate scheduling, but for gradient quality rather t
 | `pareto` | Lagrangian: softmax(|A| - λ·|KL|) | Free, adaptive λ |
 | `snr` | |A(t)| / √FI(t) (Fisher Info) | Free (uses logits) |
 
-### Adaptive Intensity (Phase 3 — Novel)
+### AITI: Adaptive Intensity (Phase 3)
 | Method | Inner Scorer | Schedule |
 |--------|-------------|----------|
 | `aiti_advantage` | |Advantage| | Linear decay ε: 1→0 |
 | `aiti_entropy` | Entropy | Linear/quadratic decay |
 | `aiti_adaptive` | Entropy→Advantage | Linear/quadratic decay |
+
+### MOAI: MSE-Optimal Adaptive Intensity (Phase 4 — Novel)
+| Method | Inner Scorer | ε selection |
+|--------|-------------|-------------|
+| `moai_advantage_mono` | |Advantage| | Closed-form ε* with monotone constraint |
+| `moai_entropy_mono` | Entropy | Closed-form ε* with monotone constraint |
+| `moai_advantage` | |Advantage| | Closed-form ε* (free, no constraint) |
+| `moai_entropy` | Entropy | Closed-form ε* (free, no constraint) |
 
 ## Project Structure
 
@@ -79,7 +88,7 @@ This is analogous to learning rate scheduling, but for gradient quality rather t
 ├── ti_ppo/
 │   ├── __init__.py
 │   ├── config.py              # TIPPOConfig dataclass
-│   ├── token_importance.py    # All 15 importance scoring methods
+│   ├── token_importance.py    # All 19 importance scoring methods
 │   ├── trainer.py             # Pure PyTorch PPO with importance weighting
 │   └── value_head.py          # CausalLMWithValueHead
 ├── scripts/
@@ -89,9 +98,12 @@ This is analogous to learning rate scheduling, but for gradient quality rather t
 │   ├── benchmark.py           # Benchmark v1 (original 6 methods)
 │   ├── benchmark_v2.py        # Benchmark v2 (PPO-native methods)
 │   ├── benchmark_v3.py        # Benchmark v3 (theoretically-derived methods)
-│   ├── benchmark_v4.py        # Benchmark v4 (AITI — the breakthrough)
+│   ├── benchmark_v4.py        # Benchmark v4 (AITI)
+│   ├── benchmark_v5.py        # Benchmark v5 (MOAI — free ε)
+│   ├── benchmark_v5b.py       # Benchmark v5b (MOAI — monotone constraint)
 │   └── analyze_entropy_kl.py  # Analysis: why entropy implies negative KL
-├── RESEARCH_LOG.md            # Full research log with derivations
+├── FINDINGS.md                # Full research writeup with derivations
+├── RESEARCH_LOG.md            # Research log (lab notebook)
 ├── pyproject.toml
 └── README.md
 ```

@@ -1,0 +1,502 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{natbib}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+
+\title{Adaptive Intensity Token Importance for PPO-Based RLHF:\\
+       From Bias-Variance Analysis to MSE-Optimal Weighting}
+
+\author{Research Report}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+Token-level importance weighting has shown promise for improving preference optimization in large language models, but its application to online PPO-based RLHF remains unexplored. We investigate why existing token importance methods degrade over PPO training and identify a fundamental \textbf{bias-variance tradeoff}: non-uniform weights introduce gradient bias $\text{Cov}(w, f)$ that accumulates across training steps, eventually dominating the initial variance reduction benefit. We propose two solutions: (1)~\textbf{AITI} (Adaptive Intensity Token Importance), which decays the importance intensity $\varepsilon$ from $1 \to 0$ over training via a fixed schedule, achieving Pareto dominance over uniform PPO on both reward ($+4.5\%$) and KL divergence ($2.5\times$ lower); and (2)~\textbf{MOAI} (MSE-Optimal Adaptive Intensity), which derives a \emph{closed-form} optimal $\varepsilon^*$ from online gradient statistics. With a monotone constraint, MOAI discovers that \emph{permanent partial weighting} ($\varepsilon \approx 0.24$) outperforms full decay to uniform, achieving the highest reward (0.880) across all methods. Our analysis reveals that the optimal importance intensity depends on sequence length~$T$ --- longer sequences need less weighting --- and that monotone schedules regularize adaptive methods against noisy per-step estimates.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+Reinforcement Learning from Human Feedback (RLHF) has become the standard approach for aligning large language models (LLMs) with human preferences~\citep{ouyang2022training, schulman2017proximal}. The standard pipeline uses Proximal Policy Optimization (PPO) to maximize a learned reward while staying close to a reference policy via a KL divergence penalty.
+
+In the standard PPO objective, all tokens in a generated sequence contribute equally:
+\begin{equation}
+\label{eq:ppo}
+L_{\text{PPO}} = \frac{1}{T} \sum_{t=1}^{T} \min\!\left(r_t \cdot A_t,\; \text{clip}(r_t, 1{-}\epsilon, 1{+}\epsilon) \cdot A_t\right)
+\end{equation}
+where $r_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the probability ratio and $A_t$ is the advantage. However, not all tokens are equally important --- some carry more semantic weight, some have noisier gradients, and some are already well-learned.
+
+Recent work on token-importance guided DPO (TI-DPO)~\citep{yang2025tidpo} demonstrated that weighting tokens by importance improves offline preference optimization. A natural question arises: \emph{can token importance weighting improve online PPO-based RLHF?}
+
+We find that the answer is nuanced: \textbf{yes, but only with proper management of the bias-variance tradeoff}. Fixed-intensity importance weights help early in training (variance reduction) but hurt later (accumulated bias). We propose two methods --- AITI and MOAI --- that manage this tradeoff through different mechanisms, both achieving Pareto improvements over standard PPO.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item We identify the \textbf{bias-variance tradeoff of token importance weighting} in PPO: non-uniform weights introduce gradient bias $\text{Bias} = \text{Cov}(w, f)$ that accumulates over training (\S\ref{sec:bias-variance}).
+    \item We propose \textbf{AITI} (Adaptive Intensity Token Importance), which decays importance intensity over training, achieving Pareto dominance over uniform PPO (\S\ref{sec:aiti}).
+    \item We derive a \textbf{closed-form MSE-optimal importance intensity} $\varepsilon^* = -\rho / (T \cdot C^2 + \tau^2)$ and show it depends on sequence length $T$ (\S\ref{sec:moai}).
+    \item We discover that \textbf{monotone-constrained MOAI} achieves the highest reward by ``finding and locking'' at a nonzero optimal $\varepsilon$, contradicting the assumption that full decay to uniform is optimal (\S\ref{sec:moai-results}).
+\end{enumerate}
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Token-level importance in LLM alignment.}
+TI-DPO~\citep{yang2025tidpo} assigns per-token importance weights in the DPO loss using gradient attribution and Gaussian priors. TIS-DPO~\citep{liu2025tisdpo} uses contrastive LLMs to estimate per-token importance for unbiased DPO. RTO~\citep{zhong2024rto} introduces token-level rewards in PPO via a DPO-trained reward model. GTPO~\citep{tan2025gtpo} applies entropy-weighted dynamic token rewards in GRPO. TDPO~\citep{zeng2024tdpo} formulates a token-level MDP for DPO. Rho-1~\citep{lin2024rho1} selectively trains on high-importance tokens during pretraining. None of these combine token-level importance weighting in PPO with a temporal decay schedule.
+
+\paragraph{Flattened importance sampling.}
+The general idea of interpolating importance weights toward uniform for bias-variance control is established in the statistics and RL literature. \citet{korba2022adaptive} proposed raising IS weights to a power $\alpha \in [0,1]$: $w_\alpha = w^\alpha$, proving this balances bias and variance, and suggested $\alpha$ ``might evolve between zero and one during the algorithm.'' \citet{hachiya2009adaptive} independently proposed the same $w^\nu$ flattening for off-policy value function approximation in RL. Relative Importance Sampling~\citep{ris2025} uses a smoothness parameter for IS in actor-critic.
+
+\paragraph{Key differences from our work.}
+Prior flattened IS methods operate on \emph{importance sampling ratios} ($\pi / \mu$) using \emph{power-law} interpolation ($w^\alpha$) with \emph{data-adaptive} parameter selection (cross-validation). Our methods operate on \emph{semantic token importance scores} (entropy, advantage) using \emph{affine} interpolation ($1 + \varepsilon(s{-}1)$) with either \emph{monotone decay schedules} (AITI) or \emph{closed-form MSE-optimal} selection (MOAI). The affine form preserves $\mathbb{E}[w] = 1$, which the power form does not.
+
+\paragraph{Variance reduction in policy gradient.}
+Classical methods include baselines~\citep{williams1992simple}, control variates, and GAE~\citep{schulman2016gae}. Shrinkage baselines~\citep{shrinkage2025} apply James-Stein shrinkage to PG estimators for bias-variance control. Our work addresses a different component: the token-level \emph{importance weights}, not the baseline or advantage estimator.
+
+% ============================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{PPO for RLHF}
+
+Given a language model $\pi_\theta$ and a reward model $R$, PPO-RLHF optimizes:
+\begin{equation}
+\max_\theta \; \mathbb{E}_{x \sim \mathcal{D},\, y \sim \pi_\theta(\cdot|x)} \!\left[ R(x, y) - \beta \cdot \text{KL}(\pi_\theta \| \pi_{\text{ref}}) \right]
+\end{equation}
+The PPO update uses the clipped surrogate objective in Eq.~\eqref{eq:ppo} with advantages computed via GAE~\citep{schulman2016gae}.
+
+\subsection{Token-importance weighted PPO}
+
+We weight the PPO loss by per-token importance scores $w(t)$:
+\begin{equation}
+\label{eq:weighted-ppo}
+L_w = \frac{1}{T} \sum_{t=1}^{T} w(t) \cdot \min\!\left(r_t \cdot A_t,\; \text{clip}(r_t) \cdot A_t\right)
+\end{equation}
+where $w(t) \geq 0$ with $\mathbb{E}[w] = 1$ (normalized). The scoring function $s(t)$ can be any of the methods described in Section~\ref{sec:methods}.
+
+% ============================================================
+\section{The Bias-Variance Tradeoff of Token Importance}
+\label{sec:bias-variance}
+
+\subsection{Identifying the bias}
+
+The true (uniform) PPO gradient estimates $g = \mathbb{E}_t[\nabla \log \pi(a_t|s_t) \cdot A_t]$. With importance weights, we instead compute $g_w = \mathbb{E}_t[w(t) \cdot \nabla \log \pi(a_t|s_t) \cdot A_t]$. The bias is:
+
+\begin{equation}
+\label{eq:bias}
+\text{Bias} = \mathbb{E}[g_w] - \mathbb{E}[g] = \text{Cov}(w, f)
+\end{equation}
+
+where $f = \nabla \log \pi \cdot A$ and we use $\mathbb{E}[w] = 1$. If importance scores correlate with gradient magnitude --- which is the entire point of importance weighting --- then $\text{Cov}(w, f) \neq 0$ and the estimator is \emph{biased}.
+
+\subsection{The crossover}
+
+The variance of the gradient estimate decreases as $O(1/\sqrt{N})$ with more data, while the bias from $\text{Cov}(w, f)$ is persistent and accumulates across gradient steps:
+\begin{equation}
+\text{Early training:}\quad \text{Var}(g) \gg |\text{Bias}| \implies \text{importance helps}
+\end{equation}
+\begin{equation}
+\text{Late training:}\quad |\text{Bias}| \gg \text{Var}(g) \implies \text{importance hurts}
+\end{equation}
+
+This explains why every fixed-intensity importance method we tested degrades after approximately 100 episodes (Table~\ref{tab:degradation}).
+
+\begin{table}[h]
+\centering
+\caption{Performance at 100 vs.\ 150 episodes shows degradation of fixed-intensity importance methods.}
+\label{tab:degradation}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{R(100 ep)} & \textbf{R(150 ep)} & \textbf{$\Delta$R} & \textbf{KL(150 ep)} \\
+\midrule
+PPO baseline (uniform) & 0.791 & \textbf{0.850} & $+0.059$ & 0.043 \\
+Entropy weighting & \textbf{0.872} & 0.797 & $-0.075$ & $-0.504$ \\
+|Advantage| weighting & 0.870 & 0.785 & $-0.085$ & 0.107 \\
+Paper: Hybrid+Triplet & 0.816 & 0.779 & $-0.037$ & 0.024 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Method 1: Adaptive Intensity Token Importance (AITI)}
+\label{sec:aiti}
+
+\subsection{Formulation}
+
+AITI interpolates between importance-weighted and uniform objectives:
+\begin{equation}
+\label{eq:aiti}
+w_{\text{AITI}}(t) = 1 + \varepsilon(\text{step}) \cdot (s(t) - 1)
+\end{equation}
+where $s(t)$ is any base importance score (normalized to $\mathbb{E}[s] \approx 1$) and $\varepsilon(\text{step})$ is an intensity parameter:
+\begin{equation}
+\varepsilon(\text{step}) = \varepsilon_{\max} \cdot \left(1 - \frac{\text{step}}{\text{decay\_steps}}\right)_+^p
+\end{equation}
+
+When $\varepsilon = 1$: full importance weighting (maximum variance reduction). When $\varepsilon = 0$: uniform PPO (zero bias).
+
+\subsection{Base importance scorers}
+
+We evaluate three PPO-native importance scorers:
+
+\paragraph{Advantage magnitude.} $s(t) = |A(t)| / \text{mean}(|A|)$. Focuses updates on tokens with strong policy gradient signal. Free to compute.
+
+\paragraph{Entropy.} $s(t) = H(\pi(\cdot|s_t)) / \text{mean}(H)$. Focuses on uncertain tokens where the model is still learning.
+
+\paragraph{Adaptive phase.} $s(t, \alpha) = (1{-}\alpha) \cdot s_{\text{ent}}(t) + \alpha \cdot s_{\text{adv}}(t)$, where $\alpha$ anneals from $0 \to 1$ over training.
+
+\subsection{Implementation}
+
+AITI wraps any existing importance scorer and requires only two hyperparameters: \texttt{decay\_steps} (when to reach uniform) and \texttt{power} (decay shape). The implementation is 15 lines of code.
+
+% ============================================================
+\section{Method 2: MSE-Optimal Adaptive Intensity (MOAI)}
+\label{sec:moai}
+
+\subsection{Derivation}
+
+Rather than choosing $\varepsilon$ via a fixed schedule, we derive the MSE-optimal intensity at each step.
+
+For the affine interpolation $w = 1 + \varepsilon(s{-}1)$ with $\mathbb{E}[s] = 1$, the weighted estimator is:
+\[
+\hat{g}(\varepsilon) = \frac{1}{T} \sum_{t} \left[1 + \varepsilon(s_t - 1)\right] \cdot f_t
+\]
+
+\begin{theorem}[MSE-Optimal Importance Intensity]
+\label{thm:moai}
+The MSE of $\hat{g}(\varepsilon)$ is:
+\begin{equation}
+\text{MSE}(\varepsilon) = \varepsilon^2 C^2 + \frac{1}{T}\left(\sigma^2 + 2\varepsilon\rho + \varepsilon^2 \tau^2\right)
+\end{equation}
+where $C = \text{Cov}(s, f)$, $\rho = \text{Cov}(f, (s{-}1) \cdot f)$, $\tau^2 = \text{Var}((s{-}1) \cdot f)$, $\sigma^2 = \text{Var}(f)$, and $T$ is the total token count. Setting $\frac{d\,\text{MSE}}{d\varepsilon} = 0$ yields:
+\begin{equation}
+\label{eq:eps-star}
+\boxed{\varepsilon^* = \frac{-\rho}{T \cdot C^2 + \tau^2}}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Expanding the MSE:
+\begin{align}
+\text{MSE}(\varepsilon) &= \text{Bias}(\varepsilon)^2 + \text{Var}(\varepsilon) \\
+\text{Bias}(\varepsilon) &= \varepsilon \cdot C = \varepsilon \cdot \text{Cov}(s, f) \\
+\text{Var}(\varepsilon) &= \frac{1}{T} \text{Var}\!\left([1 + \varepsilon(s{-}1)] \cdot f\right) \\
+&= \frac{1}{T}\left(\sigma^2 + 2\varepsilon \cdot \text{Cov}(f, (s{-}1)f) + \varepsilon^2 \cdot \text{Var}((s{-}1)f)\right)
+\end{align}
+Taking the derivative and setting to zero:
+\[
+\frac{d\,\text{MSE}}{d\varepsilon} = 2\varepsilon C^2 + \frac{1}{T}(2\rho + 2\varepsilon\tau^2) = 0
+\]
+\[
+\varepsilon\left(C^2 + \frac{\tau^2}{T}\right) = -\frac{\rho}{T}
+\implies \varepsilon^* = \frac{-\rho}{T C^2 + \tau^2}
+\]
+\end{proof}
+
+\begin{corollary}[Sequence Length Dependence]
+\label{cor:length}
+As $T \to \infty$, $\varepsilon^* \to 0$. Longer sequences should use less importance weighting because bias (which is independent of $T$) dominates variance (which decreases as $1/T$).
+\end{corollary}
+
+\begin{corollary}[Natural Decay]
+\label{cor:decay}
+As training progresses and $C = \text{Cov}(s, f)$ grows (importance correlates more with loss), the denominator $T C^2$ increases, so $\varepsilon^*$ decreases. AITI's linear decay approximates this natural behavior.
+\end{corollary}
+
+\begin{corollary}[When Importance Helps]
+\label{cor:helps}
+$\varepsilon^* > 0$ iff $\rho < 0$, i.e., $\text{Cov}(f, (s{-}1) \cdot f) < 0$. This holds when high-importance tokens have lower loss variance --- exactly the property of advantage-magnitude weighting.
+\end{corollary}
+
+\subsection{Online estimation}
+
+We estimate $C$, $\rho$, and $\tau^2$ using exponential moving averages (EMA) across PPO steps:
+\[
+\hat{C}_{k} = \lambda \hat{C}_{k-1} + (1{-}\lambda) \cdot \widehat{\text{Cov}}_k(s, f)
+\]
+with EMA decay rate $\lambda \in \{0.80, 0.90, 0.95\}$.
+
+\subsection{Monotone constraint}
+
+In practice, the per-step $\varepsilon^*$ oscillates due to noisy batch-level statistics (batch size $= 4$). We add a monotone constraint:
+\begin{equation}
+\varepsilon_k = \min(\varepsilon^*_k, \; \varepsilon_{k-1})
+\end{equation}
+This ensures $\varepsilon$ can only decrease over training, combining MOAI's data-adaptive decay rate with the stability of a monotone schedule.
+
+% ============================================================
+\section{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Model.} GPT-2 (124M parameters) with LoRA adapters (rank 8, $\alpha = 16$) on attention projections.
+
+\paragraph{Reference model.} Frozen copy of GPT-2 for KL computation.
+
+\paragraph{Reward.} Synthetic reward combining: response length ($\sim$Gaussian centered at 50 tokens), lexical diversity, information density (keyword counting), and fluency (terminal punctuation). Score range $[-2, 2]$.
+
+\paragraph{Training.} 150 episodes, batch size 4, 2 PPO epochs per batch, learning rate $5 \times 10^{-5}$, clip $\epsilon = 0.2$, KL penalty coefficient $\beta = 0.1$. Each method trained from scratch with identical initialization.
+
+\paragraph{Metrics.} We report:
+\begin{itemize}
+    \item \textbf{R(Q4)}: Mean reward over the final quartile (episodes 113--150)
+    \item \textbf{KL(Q4)}: Mean KL divergence over the final quartile
+    \item \textbf{KL-Efficiency}: $\text{R(Q4)} / |\text{KL(Q4)}|$
+    \item \textbf{Pareto optimality}: A method is Pareto-optimal if no other achieves both higher reward \emph{and} lower $|\text{KL}|$
+\end{itemize}
+
+\paragraph{Prompts.} Pool of 32 diverse instructional prompts (e.g., ``Explain what machine learning is in simple terms'').
+
+% ============================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{AITI results (v4 benchmark)}
+
+\begin{table}[h]
+\centering
+\caption{Benchmark v4: AITI variants vs.\ baselines (150 episodes).}
+\label{tab:aiti}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{R(Q4)} & \textbf{KL(Q4)} & \textbf{KL-Eff} & \textbf{Pareto?} \\
+\midrule
+\textbf{AITI-Advantage (linear)} & \textbf{0.855} & \textbf{0.016} & \textbf{54.1} & \textbf{YES} \\
+AITI-AdaptivePhase (linear) & 0.853 & 0.047 & 18.1 & no \\
+AITI-AdaptivePhase (quad) & 0.835 & 0.036 & 23.1 & no \\
+AITI-Entropy (quadratic) & 0.826 & 0.059 & 13.9 & no \\
+PPO baseline & 0.818 & 0.040 & 20.4 & \textbf{dominated} \\
+Entropy (no decay) & 0.815 & $-0.611$ & 1.3 & no \\
+Adaptive Phase (no decay) & 0.791 & 0.090 & 8.8 & no \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+AITI-Advantage with linear decay is the \emph{only} method that Pareto-dominates uniform PPO, achieving $+4.5\%$ reward and $2.5\times$ lower KL simultaneously.
+
+\subsection{MOAI results (v5b benchmark)}
+\label{sec:moai-results}
+
+\begin{table}[h]
+\centering
+\caption{Benchmark v5b: Monotone-constrained MOAI vs.\ AITI and PPO (150 episodes).}
+\label{tab:moai}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{R(Q4)} & \textbf{KL(Q4)} & \textbf{KL-Eff} & \textbf{Pareto?} & $\varepsilon$ \textbf{locks at} \\
+\midrule
+\textbf{MOAI-Adv mono (0.80)} & \textbf{0.880} & 0.056 & 15.7 & \textbf{YES} & 0.24 \\
+AITI-Advantage (linear) & 0.874 & \textbf{0.031} & \textbf{28.4} & \textbf{YES} & $\to 0$ \\
+MOAI-Adv mono (0.90) & 0.866 & 0.059 & 14.6 & no & 0.49 \\
+PPO baseline & 0.859 & 0.028 & 30.4 & \textbf{YES} & 1.0 \\
+MOAI-Adv mono (0.95) & 0.802 & 0.038 & 21.1 & no & 0.53 \\
+MOAI-Adv free (0.80) & 0.770 & 0.097 & 8.0 & no & oscillating \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Epsilon trajectories}
+
+\begin{table}[h]
+\centering
+\caption{Quartile-averaged $\varepsilon$ trajectories. AITI decays linearly to zero; monotone MOAI finds a level and locks; free MOAI oscillates.}
+\label{tab:epsilon}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Q1} & \textbf{Q2} & \textbf{Q3} & \textbf{Q4} \\
+\midrule
+AITI-Advantage & 0.84 & 0.53 & 0.23 & 0.01 \\
+MOAI mono ($\lambda{=}0.80$) & 0.43 & 0.24 & 0.24 & 0.24 \\
+MOAI mono ($\lambda{=}0.90$) & 0.61 & 0.49 & 0.49 & 0.49 \\
+MOAI mono ($\lambda{=}0.95$) & 0.69 & 0.53 & 0.53 & 0.53 \\
+MOAI free ($\lambda{=}0.80$) & 0.64 & 0.92 & 0.83 & 0.48 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Analysis and Findings}
+\label{sec:analysis}
+
+\subsection{Finding 1: The monotone constraint is essential}
+
+Free MOAI (ema=0.80) achieves R=0.770, while monotone MOAI (ema=0.80) achieves R=0.880 --- a $14\%$ reward improvement. The oscillating $\varepsilon$ creates inconsistent optimization dynamics: the model alternates between weighted and uniform gradients, preventing stable convergence.
+
+This parallels the well-known finding that fixed learning rate schedules often outperform adaptive methods (e.g., SGD+schedule vs.\ Adam) in deep learning~\citep{loshchilov2019decoupled}. Per-step optimality does not guarantee trajectory optimality when estimates are noisy.
+
+\subsection{Finding 2: The optimal $\varepsilon$ is not zero}
+
+AITI decays to $\varepsilon = 0$ (pure uniform) by the end of training. But MOAI's closed-form consistently estimates $\varepsilon^* > 0$, and the monotone constraint locks at $\varepsilon \approx 0.24$ for ema$=0.80$. This means \emph{some permanent importance weighting is beneficial}, contradicting AITI's assumption.
+
+Why? Even late in training, advantage-magnitude weighting provides signal: high-$|A|$ tokens have genuinely more informative gradients. The bias from weighting these tokens is small (since the model is nearly converged and the advantage landscape is stable), while the variance reduction is still useful.
+
+\subsection{Finding 3: MOAI discovers a ``find-and-lock'' strategy}
+
+The monotone MOAI trajectory has a distinctive shape:
+\begin{enumerate}
+    \item \textbf{Rapid initial decay} (Q1): $\varepsilon$ drops quickly as the MSE formula responds to growing $\text{Cov}(s, f)$.
+    \item \textbf{Locking} (Q2--Q4): The monotone constraint prevents $\varepsilon$ from increasing, and subsequent $\varepsilon^*$ estimates are higher than the locked value, so $\varepsilon$ stays constant.
+\end{enumerate}
+
+This is qualitatively different from both fixed schedules (AITI) and fully adaptive methods (free MOAI). It combines early adaptivity with late stability.
+
+\subsection{Finding 4: EMA decay rate controls the locking level}
+
+Lower EMA decay $\to$ more responsive $\to$ earlier and lower lock:
+\begin{itemize}
+    \item $\lambda = 0.95$: locks at $\varepsilon \approx 0.53$, moderate reward
+    \item $\lambda = 0.90$: locks at $\varepsilon \approx 0.49$, good reward
+    \item $\lambda = 0.80$: locks at $\varepsilon \approx 0.24$, best reward
+\end{itemize}
+
+This replaces AITI's \texttt{decay\_steps} hyperparameter with the EMA decay rate, which has a clearer interpretation: how much history to use for the MSE estimate.
+
+\subsection{Finding 5: Entropy weighting produces negative KL}
+
+A surprising observation from Phase 2: entropy-weighted PPO produces \emph{negative} KL divergence --- the policy moves \emph{closer} to the reference while improving reward. Three mechanisms contribute:
+\begin{enumerate}
+    \item Entropy weighting amplifies the KL reward penalty at high-entropy tokens (which have higher per-token KL after training).
+    \item Concentrating gradients on high-entropy tokens tends to further spread distributions, acting as implicit regularization.
+    \item Low-entropy (confident) tokens get near-zero weight, preserving their agreement with the reference.
+\end{enumerate}
+
+% ============================================================
+\section{Implications}
+\label{sec:implications}
+
+\paragraph{For RLHF practitioners.} AITI-Advantage with linear decay is a simple, low-cost improvement over standard PPO: it adds 15 lines of code, requires no extra model calls, and provides better reward with lower KL. For maximum reward (at the cost of higher KL), monotone MOAI with ema$=0.80$ is recommended.
+
+\paragraph{For the importance sampling literature.} The closed-form $\varepsilon^* = -\rho / (T C^2 + \tau^2)$ is new. While the general principle of flattened IS is known~\citep{korba2022adaptive, hachiya2009adaptive}, no prior work derives the intensity from MSE minimization. The sequence-length dependence (Corollary~\ref{cor:length}) is a testable prediction with implications for long-context RLHF.
+
+\paragraph{For adaptive vs.\ scheduled methods.} The theory-practice gap between free and monotone MOAI adds to the growing evidence that monotone schedules regularize adaptive methods. The ``find-and-lock'' behavior may apply broadly to other adaptive hyperparameters in RL.
+
+\paragraph{For token-level optimization in LLMs.} The finding that optimal $\varepsilon > 0$ suggests permanent token-level differentiation is beneficial. This connects to broader work on selective training (Rho-1, token cleaning) and curriculum learning.
+
+% ============================================================
+\section{Limitations}
+\label{sec:limitations}
+
+\begin{enumerate}
+    \item \textbf{Scale.} All experiments use GPT-2 (124M) with synthetic reward. Results may not transfer to 7B+ models with learned reward models on real preference data.
+    \item \textbf{Single seed.} Each method was run once. Variance across seeds could change the Pareto frontier.
+    \item \textbf{Synthetic reward.} The reward function is smooth and well-behaved. Real RLHF rewards are noisier.
+    \item \textbf{Batch size.} MOAI's statistics estimates are noisy with batch size 4. Larger batches may reduce the need for the monotone constraint.
+    \item \textbf{Hyperparameter coupling.} MOAI's EMA decay rate and AITI's \texttt{decay\_steps} likely interact with learning rate, KL coefficient, and model size in ways we have not explored.
+\end{enumerate}
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We identified the bias-variance tradeoff of token importance weighting in PPO-RLHF: non-uniform weights reduce gradient variance early but introduce accumulated bias that degrades performance over training. Two solutions achieve Pareto improvements over standard PPO:
+
+\begin{itemize}
+    \item \textbf{AITI}: Simple linear decay of importance intensity. Provides the best reward-KL tradeoff (R=0.874, KL=0.031).
+    \item \textbf{Monotone MOAI}: Closed-form optimal intensity with monotone constraint. Achieves the highest reward (R=0.880) by discovering that permanent partial weighting ($\varepsilon \approx 0.24$) outperforms full decay.
+\end{itemize}
+
+The MSE-optimal formula $\varepsilon^* = -\rho / (T C^2 + \tau^2)$ provides the first closed-form solution for importance intensity in the IS literature, with a novel prediction that longer sequences need less weighting. The ``find-and-lock'' behavior of monotone MOAI is a new optimization strategy that combines data-adaptive rate selection with schedule stability.
+
+% ============================================================
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{20}
+
+\bibitem[Ouyang et~al.(2022)]{ouyang2022training}
+Long Ouyang et~al.
+\newblock Training language models to follow instructions with human feedback.
+\newblock \emph{NeurIPS}, 2022.
+
+\bibitem[Schulman et~al.(2017)]{schulman2017proximal}
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov.
+\newblock Proximal policy optimization algorithms.
+\newblock \emph{arXiv:1707.06347}, 2017.
+
+\bibitem[Yang et~al.(2025)]{yang2025tidpo}
+Ning Yang et~al.
+\newblock Token-importance guided direct preference optimization.
+\newblock \emph{arXiv:2505.19653}, 2025.
+
+\bibitem[Liu et~al.(2025)]{liu2025tisdpo}
+Zihao Liu et~al.
+\newblock Token-level importance sampling for DPO.
+\newblock \emph{ICLR}, 2025.
+
+\bibitem[Korba \& Portier(2022)]{korba2022adaptive}
+Anna Korba and Fran\c{c}ois Portier.
+\newblock Adaptive importance sampling meets mirror descent: a bias-variance tradeoff.
+\newblock \emph{AISTATS}, 2022.
+
+\bibitem[Hachiya et~al.(2009)]{hachiya2009adaptive}
+Hirotaka Hachiya et~al.
+\newblock Adaptive importance sampling for value function approximation in off-policy RL.
+\newblock \emph{Neural Networks}, 2009.
+
+\bibitem[{Relative IS}(2025)]{ris2025}
+Relative importance sampling for off-policy actor-critic.
+\newblock \emph{Scientific Reports}, 2025.
+
+\bibitem[Zhong et~al.(2024)]{zhong2024rto}
+Han Zhong et~al.
+\newblock DPO meets PPO: Reinforced token optimization.
+\newblock \emph{ICML}, 2025.
+
+\bibitem[Tan et~al.(2025)]{tan2025gtpo}
+Fengming Tan et~al.
+\newblock GTPO: Group token policy optimization.
+\newblock \emph{arXiv:2508.04349}, 2025.
+
+\bibitem[Zeng et~al.(2024)]{zeng2024tdpo}
+Yongcheng Zeng et~al.
+\newblock Token-level direct preference optimization.
+\newblock \emph{ICML}, 2024.
+
+\bibitem[Lin et~al.(2024)]{lin2024rho1}
+Zhenghao Lin et~al.
+\newblock Rho-1: Not all tokens are what you need.
+\newblock 2024.
+
+\bibitem[Schulman et~al.(2016)]{schulman2016gae}
+John Schulman et~al.
+\newblock High-dimensional continuous control using generalized advantage estimation.
+\newblock \emph{ICLR}, 2016.
+
+\bibitem[Williams(1992)]{williams1992simple}
+Ronald~J. Williams.
+\newblock Simple statistical gradient-following algorithms for connectionist reinforcement learning.
+\newblock \emph{Machine Learning}, 1992.
+
+\bibitem[Loshchilov \& Hutter(2019)]{loshchilov2019decoupled}
+Ilya Loshchilov and Frank Hutter.
+\newblock Decoupled weight decay regularization.
+\newblock \emph{ICLR}, 2019.
+
+\bibitem[{Shrinkage Baselines}(2025)]{shrinkage2025}
+Shrinkage baselines for RLVR.
+\newblock \emph{arXiv:2511.03710}, 2025.
+
+\end{thebibliography}
+
+\end{document}

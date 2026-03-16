@@ -15,6 +15,7 @@ from .token_importance import (
     SNRImportance,
     EntropyKLLagrangianImportance,
     AdaptiveIntensityImportance,
+    MSEOptimalImportance,
 )
 from .trainer import TIPPOTrainer
 from .config import TIPPOConfig

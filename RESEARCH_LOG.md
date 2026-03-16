@@ -207,3 +207,33 @@ This is a bias-variance SCHEDULE:
 - Related to simulated annealing: explore (weighted) early, exploit (uniform) late
 - Connected to importance sampling ESS: ε controls the effective sample size
   of the weighted gradient estimate
+
+## Phase 4: MSE-Optimal Adaptive Intensity (MOAI)
+
+### The problem with AITI
+AITI uses a hand-tuned decay schedule (decay_steps, power). Can we derive the optimal ε from data?
+
+### Closed-form MSE-optimal ε
+For w = 1 + ε(s-1), the MSE-optimal intensity is:
+  ε* = -ρ / (T·C² + τ²)
+where C = Cov(s,f), ρ = Cov(f,(s-1)·f), τ² = Var((s-1)·f), T = token count.
+
+### V5 result: ε oscillates (theory-practice gap)
+Free MOAI's ε bounces between 0.4-1.0 due to noisy batch-level statistics.
+Free MOAI-Adv: R=0.776, KL=0.123 — worse than AITI and PPO.
+
+### Fix: Monotone constraint (ε can only decrease)
+
+### V5b result: Monotone MOAI achieves highest reward
+| Method | R(Q4) | KL(Q4) | Pareto? | ε locks at |
+|--------|-------|--------|---------|-----------|
+| MOAI-Adv mono (0.80) | **0.880** | 0.056 | **YES** | 0.24 |
+| AITI-Advantage | 0.874 | 0.031 | **YES** | → 0 |
+| PPO baseline | 0.859 | 0.028 | **YES** | 1.0 |
+
+### Key insight: The optimal ε is NOT zero
+MOAI discovers that permanent partial weighting (ε≈0.24) beats AITI's full
+decay to zero. The "find-and-lock" behavior is a new optimization strategy:
+- Rapid early decay (like AITI)
+- Data-adaptive locking at optimal level (unlike AITI)
+- No decay_steps hyperparameter needed

@@ -11,3 +11,5 @@ checkpoints/
 *.bin
 *.safetensors
 .env
+*.log
+nohup.out
