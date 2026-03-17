@@ -117,6 +117,7 @@ where $w(t)$ is one of the paper's scores: \textbf{gradient norm} $\|\nabla_{\te
 % ============================================================
 \begin{frame}{Phase 1 Results: Direct Port Fails}
 
+\textit{\scriptsize Synthetic benchmark: GPT-2 124M + LoRA, sentiment reward, 150 episodes}
 \begin{table}
 \begin{tabular}{lccc}
 \toprule
@@ -195,7 +196,9 @@ Entropy naturally identifies \textbf{decision points} --- tokens where the model
 % ============================================================
 \begin{frame}{Entropy Weighting: Promising Early Results}
 
-We apply entropy weights to the PPO loss (``entropy weighting'') and train for 150 episodes:
+\textit{\scriptsize Synthetic benchmark: GPT-2 124M + LoRA, sentiment reward}
+
+We apply entropy weights to the PPO loss and train for 150 episodes:
 
 \vspace{0.2cm}
 \begin{table}
@@ -292,6 +295,7 @@ Late (policy stabilizing) & Low & Low (equal treatment, no bias) \\
 % ============================================================
 \begin{frame}{AITI Results: Entropy Weighting That Doesn't Degrade}
 
+\textit{\scriptsize Synthetic benchmark: GPT-2 124M + LoRA, sentiment reward, 150 episodes}
 \begin{table}
 \begin{tabular}{lcccc}
 \toprule
@@ -344,6 +348,8 @@ AITI requires choosing a decay schedule. Can we compute the best $\varepsilon$ p
 % SLIDE 12: MOAI finding
 % ============================================================
 \begin{frame}{MOAI Finding: Partial Weighting Can Be Optimal}
+
+\textit{\scriptsize Synthetic benchmark: GPT-2 124M + LoRA, sentiment reward, 150 episodes}
 
 \textbf{Empirical observation:} MOAI converges to $\varepsilon^* \approx 0.3$--$0.5$, not zero.
 
