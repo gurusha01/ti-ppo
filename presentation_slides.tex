@@ -406,7 +406,7 @@ MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-eff
 % ============================================================
 % SLIDE 14: GSM8K Results
 % ============================================================
-\begin{frame}{GSM8K Results (1.5B Model)}
+\begin{frame}{GSM8K Results (Qwen2.5-1.5B, 200 Episodes)}
 
 \begin{columns}
 \begin{column}{0.52\textwidth}
@@ -416,33 +416,37 @@ MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-eff
 \scriptsize
 \begin{tabular}{lcc}
 \toprule
-Method & Test Acc & vs Base \\
+Method & Test Acc & vs PPO \\
 \midrule
-PPO baseline & 63.1\% & +8.4\% \\
-MOAI-Entropy 0.80 & 63.0\% & +8.3\% \\
-AITI-Entropy & 62.5\% & +7.8\% \\
-Entropy (fixed) & 62.7\% & +8.0\% \\
+PPO baseline & 63.1\% & --- \\
+MOAI-Entropy 0.80 & 63.0\% & $-$0.1\% \\
+Entropy (fixed) & 62.7\% & $-$0.4\% \\
+MOAI-Entropy 0.90 & 62.7\% & $-$0.4\% \\
+AITI-Entropy & 62.5\% & $-$0.6\% \\
 \hdashline
-Base model & 54.7\% & --- \\
+Base model (no PPO) & 54.7\% & \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\vspace{0.2cm}
-All methods improve by $\sim$8\% over the base model. The differences between methods are small ($<$1\%).
+All methods improve $\sim$8\% over base. Entropy methods match baseline within 1\%.
 
-\textbf{Why?} GSM8K is relatively easy for this model --- the base already gets 55\%, leaving limited room for PPO to differentiate methods.
+GSM8K is too easy for this model to differentiate methods.
 \end{column}
 \begin{column}{0.46\textwidth}
-\textbf{Batch size matters:}
+\textbf{But batch size matters:}
 
 \begin{center}
-\vspace{0.5cm}
-\fbox{\parbox{0.85\textwidth}{\centering\vspace{1.5cm}\textit{Batch size sweep figure}\\\textit{(to be updated)}\vspace{1.5cm}}}
+\vspace{0.3cm}
+\fbox{\parbox{0.85\textwidth}{\centering\vspace{1.2cm}\textit{Batch size sweep figure}\\\textit{(to be updated)}\vspace{1.2cm}}}
 \end{center}
 
 \scriptsize
-At bs=1, entropy methods give +4--5\% over baseline. At bs=8, the gap vanishes. Entropy weighting helps most when gradient variance is high.
+At bs=1: entropy weighting gives \textbf{+4--5\%} over baseline.
+
+At bs=8: gap vanishes.
+
+$\Rightarrow$ Entropy weighting helps when gradient variance is high.
 \end{column}
 \end{columns}
 
@@ -483,43 +487,7 @@ MOAI-Entropy 0.90 & 31.1\% & \textit{running} \\
 \end{frame}
 
 % ============================================================
-% SLIDE 16: Takeaways
-% ============================================================
-\begin{frame}{Key Takeaways}
-
-\begin{enumerate}
-    \item \textbf{Entropy is the right importance signal for PPO}
-    \begin{itemize}
-        \item It identifies tokens where the model is uncertain --- decision points
-        \item Free to compute, content-aware, no extra forward/backward passes
-    \end{itemize}
-
-    \vspace{0.2cm}
-    \item \textbf{Fixed entropy weighting degrades over training}
-    \begin{itemize}
-        \item Biased gradient estimator: Cov$(w, f) \neq 0$
-        \item Helps early (variance reduction) but hurts late (accumulated bias)
-    \end{itemize}
-
-    \vspace{0.2cm}
-    \item \textbf{AITI and MOAI fix this with adaptive intensity}
-    \begin{itemize}
-        \item AITI: scheduled decay $\varepsilon: 1 \to 0$ (safe, conservative)
-        \item MOAI: per-step optimal $\varepsilon^*$ via MSE minimization (higher reward, keeps some weighting)
-    \end{itemize}
-
-    \vspace{0.2cm}
-    \item \textbf{Strongest in high-variance regimes}
-    \begin{itemize}
-        \item Small batch sizes, sparse rewards, early training
-        \item Entropy weighting is variance reduction for the policy gradient
-    \end{itemize}
-\end{enumerate}
-
-\end{frame}
-
-% ============================================================
-% SLIDE 17: Future Work
+% SLIDE 16: Future Work
 % ============================================================
 \begin{frame}{Future Directions}
 
