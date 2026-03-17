@@ -194,64 +194,51 @@ Entropy naturally identifies \textbf{decision points} --- tokens where the model
 % ============================================================
 % SLIDE 6b: Why not just rely on grad log pi?
 % ============================================================
-\begin{frame}{Wait --- Doesn't $\nabla\log\pi$ Already Contain This Information?}
-
-The policy gradient is $g = \sum_t \nabla\log\pi(a_t|s_t) \cdot \hat{A}_t$. Doesn't $\nabla\log\pi$ itself tell us which tokens matter?
-
-\vspace{0.3cm}
-\textbf{Not quite.} $\nabla\log\pi(a_t|s_t)$ tells us the direction to make token $a_t$ more likely. But:
-
-\begin{itemize}
-    \item It does \textbf{not} tell us whether updating this token is \textbf{useful for the reward}
-    \item A confident token (``the'') has a small $\|\nabla\log\pi\|$ --- but so does a token where the model is confidently \textit{wrong}
-    \item The gradient magnitude reflects \textbf{how much the output would change}, not \textbf{how much the reward cares}
-\end{itemize}
-
-\vspace{0.3cm}
-\textbf{Entropy adds orthogonal information:}
+\begin{frame}{Doesn't $\nabla\log\pi$ Already Know Which Tokens Matter?}
 
 \begin{center}
-\begin{tabular}{lcc}
+\begin{tabular}{lccc}
 \toprule
-Token type & $\|\nabla\log\pi\|$ & $H(\pi)$ \\
+Token type & $\|\nabla\log\pi\|$ & $H(\pi)$ & Useful to update? \\
 \midrule
-Confident \& correct (``the'') & small & low \\
-Confident \& wrong (``52'' instead of ``105'') & small & low \\
-\alert{Uncertain decision point (``='' before answer)} & medium & \alert{high} \\
+Confident \& correct (``the'') & small & low & No \\
+Confident \& \textbf{wrong} (``52'' not ``105'') & small & low & Yes, but gradient is small! \\
+\alert{Uncertain (``='' before answer)} & medium & \alert{high} & \alert{Yes --- most leverage} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Entropy identifies tokens where the model \textit{could go either way} --- exactly where a gradient update has the most leverage.
+\vspace{0.3cm}
+$\nabla\log\pi$ reflects \textit{how much the output would change} --- not \textit{where a change would help}.
+
+\vspace{0.3cm}
+Entropy adds what the gradient lacks: \textbf{which tokens are at a decision boundary} where a small update can tip the model toward the right answer.
 
 \end{frame}
 
 % ============================================================
 % SLIDE 7: Early results with entropy
 % ============================================================
-\begin{frame}{Entropy Weighting: Promising Early Results}
+\begin{frame}{Entropy Weighting: Helps Early, Hurts Late}
 
-\textit{\scriptsize Synthetic benchmark: GPT-2 124M + LoRA, sentiment reward}
+\textit{\scriptsize Synthetic benchmark: GPT-2 124M + LoRA, sentiment reward, 150 episodes}
 
-We apply entropy weights to the PPO loss and train for 150 episodes:
-
-\vspace{0.2cm}
 \begin{table}
 \begin{tabular}{lccc}
 \toprule
 Method & R(Q4) at ep 100 & R(Q4) at ep 150 & Trend \\
 \midrule
-\textbf{Entropy-weighted PPO} & \textbf{0.872} & 0.797 & \textcolor{bad}{$\downarrow$ degraded} \\
-PPO baseline & 0.791 & \textbf{0.850} & $\uparrow$ keeps improving \\
+Entropy-weighted PPO & \textbf{0.872} & 0.797 & \textcolor{bad}{$\downarrow$} \\
+PPO baseline & 0.791 & \textbf{0.850} & \textcolor{good}{$\uparrow$} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \vspace{0.3cm}
-At episode 100, entropy weighting is \textbf{+10\% ahead}. But by episode 150, baseline has caught up and surpassed it.
+\textbf{+10\% ahead at ep 100} $\longrightarrow$ \textbf{surpassed by ep 150}
 
 \vspace{0.3cm}
-\textbf{What happened?} The entropy weights stay fixed throughout training, but the model is changing. The tokens that were uncertain early on may no longer be the right ones to focus on later. The fixed weights become stale and introduce a systematic error that accumulates over gradient steps.
+The weights stay fixed, but the model changes. Tokens that were uncertain early may no longer be the right ones to focus on --- the fixed weights become stale and the error accumulates.
 
 \end{frame}
 
