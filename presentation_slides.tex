@@ -406,49 +406,30 @@ MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-eff
 % ============================================================
 % SLIDE 14: GSM8K Results
 % ============================================================
-\begin{frame}{GSM8K Results (Qwen2.5-1.5B, 200 Episodes)}
+\begin{frame}{GSM8K Results (Qwen2.5-1.5B, Entropy-Only Methods)}
 
-\begin{columns}
-\begin{column}{0.52\textwidth}
-\textbf{Test accuracy (1,319 examples, greedy):}
+\textit{\scriptsize 7,473 train examples, 200 episodes, batch size 4. Test eval on 1,319 examples running.}
 
+\vspace{0.2cm}
 \begin{table}
-\scriptsize
 \begin{tabular}{lcc}
 \toprule
-Method & Test Acc & vs PPO \\
+Method & Train Acc & Test Acc \\
 \midrule
-PPO baseline & 63.1\% & --- \\
-MOAI-Entropy 0.80 & 63.0\% & $-$0.1\% \\
-Entropy (fixed) & 62.7\% & $-$0.4\% \\
-MOAI-Entropy 0.90 & 62.7\% & $-$0.4\% \\
-AITI-Entropy & 62.5\% & $-$0.6\% \\
-\hdashline
-Base model (no PPO) & 54.7\% & \\
+PPO baseline & -- & \textit{running} \\
+Entropy (fixed) & -- & \textit{running} \\
+AITI-Entropy (decay=200) & -- & \textit{running} \\
+AITI-Entropy (decay=100) & -- & \textit{running} \\
+MOAI-Entropy 0.80 & -- & \textit{running} \\
+MOAI-Entropy 0.90 & -- & \textit{running} \\
+MOAI-Entropy 0.95 & -- & \textit{running} \\
+AITI-Entropy (residual=0.3) & -- & \textit{running} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-All methods improve $\sim$8\% over base. Entropy methods match baseline within 1\%.
-
-GSM8K is too easy for this model to differentiate methods.
-\end{column}
-\begin{column}{0.46\textwidth}
-\textbf{But batch size matters:}
-
-\begin{center}
-\vspace{0.3cm}
-\fbox{\parbox{0.85\textwidth}{\centering\vspace{1.2cm}\textit{Batch size sweep figure}\\\textit{(to be updated)}\vspace{1.2cm}}}
-\end{center}
-
-\scriptsize
-At bs=1: entropy weighting gives \textbf{+4--5\%} over baseline.
-
-At bs=8: gap vanishes.
-
-$\Rightarrow$ Entropy weighting helps when gradient variance is high.
-\end{column}
-\end{columns}
+\vspace{0.2cm}
+\textit{Rerunning with entropy-only methods on Qwen2.5-1.5B-Instruct. Results to be filled in.}
 
 \end{frame}
 
