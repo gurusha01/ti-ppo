@@ -183,30 +183,11 @@ meaningful variance reduction from the entropy weights.
 And the results is that MOAI gets the highest reward of any
 method, while AITI gets the best KL efficiency. 
 
-
-SLIDE 14: GSM8K Results
--------------------------
-Moving to math benchmarks. On GSM8K with a 1.5B model, we see that
-all methods improve about 8% over the base model, but the differences
-between entropy methods and baseline are within 1%. The reason is that
-GSM8K is relatively easy for this model — the base already gets 55%, so
-there's limited headroom for PPO, and even less room for entropy
-weighting to differentiate.
-
-These results are from the entropy-only rerun that's currently in
-progress, so the numbers will be updated.
-
-
 SLIDE 15: MATH-500 Results
 ----------------------------
-MATH is much harder — competition-level problems. We're running this
-with a 4B model and 500 episodes, and the early results at episode 40
-show AITI-Entropy leading at 35.4% versus the baseline at 33.5%. This
-is more promising because there's more room for improvement on this
-harder task.
-
-The final results with test accuracy are still running and will be
-filled in once they complete.
+I also tried it on MATH which is much harder competition-level problems. This is
+ a 4B model and trained on 500 episodes, and the results
+show MOAI-Entropy leading at 37.4% versus the baseline at 35.9%. 
 
 
 SLIDE 16: Future Directions
