@@ -319,25 +319,24 @@ TI-DPO Hybrid & 0.779 & 0.024 & 32.7 & dominated \\
 % ============================================================
 \begin{frame}{Can We Pick the Optimal $\varepsilon$ Automatically?}
 
-AITI requires choosing a decay schedule: how many steps? Linear or quadratic?
+AITI requires choosing a decay schedule. Can we compute the best $\varepsilon$ per step?
 
 \vspace{0.2cm}
-\textbf{Idea:} At each step, pick $\varepsilon$ to minimize the \textbf{mean squared error} of the gradient estimator:
+\textbf{Minimize MSE of the gradient estimator} (bias$^2$ + variance):
 \[
-\text{MSE}(g_\varepsilon) = \underbrace{\text{Bias}(\varepsilon)^2}_{\text{worse when } \varepsilon \text{ is large}} + \underbrace{\text{Var}(\varepsilon)}_{\text{worse when } \varepsilon \text{ is small}}
+\varepsilon^* = \arg\min_\varepsilon\; \bigl[\text{Bias}(\varepsilon)^2 + \text{Var}(\varepsilon)\bigr]
 \]
 
-\vspace{0.1cm}
-Why MSE? The PPO loss uses the gradient $g$ to update the policy. A gradient with lower MSE relative to the true gradient gives better updates. Bias$^2$ + Variance is the standard decomposition of estimation error.
-
-\vspace{0.3cm}
 \textbf{Closed-form solution} (MOAI = MSE-Optimal Adaptive Intensity):
 \[
 \varepsilon^* = \text{clip}\!\left(\frac{-C}{2\rho},\; 0,\; \varepsilon_{\text{prev}}\right)
 \]
-where $C = \text{Cov}(H_{\text{norm}}, f)$ and $\rho = \text{Var}(H_{\text{norm}}) \cdot \mathbb{E}[f^2]$, estimated via exponential moving average.
 
-The monotone constraint ($\varepsilon^* \leq \varepsilon_{\text{prev}}$) ensures intensity only decreases.
+\begin{itemize}
+    \item $C$, $\rho$ = covariance and variance statistics, estimated via EMA
+    \item Monotone constraint: $\varepsilon$ can only decrease (no oscillation)
+    \item No hyperparameter tuning --- adapts automatically to the training dynamics
+\end{itemize}
 
 \end{frame}
 
