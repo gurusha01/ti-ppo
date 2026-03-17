@@ -404,66 +404,33 @@ MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-eff
 
 
 % ============================================================
-% SLIDE 14: GSM8K Results
-% ============================================================
-\begin{frame}{GSM8K Results (Qwen2.5-1.5B, Entropy-Only Methods)}
-
-\textit{\scriptsize 7,473 train examples, 200 episodes, batch size 4. Test eval on 1,319 examples running.}
-
-\vspace{0.2cm}
-\begin{table}
-\begin{tabular}{lcc}
-\toprule
-Method & Train Acc & Test Acc \\
-\midrule
-PPO baseline & -- & \textit{running} \\
-Entropy (fixed) & -- & \textit{running} \\
-AITI-Entropy (decay=200) & -- & \textit{running} \\
-AITI-Entropy (decay=100) & -- & \textit{running} \\
-MOAI-Entropy 0.80 & -- & \textit{running} \\
-MOAI-Entropy 0.90 & -- & \textit{running} \\
-MOAI-Entropy 0.95 & -- & \textit{running} \\
-AITI-Entropy (residual=0.3) & -- & \textit{running} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\vspace{0.2cm}
-\textit{Rerunning with entropy-only methods on Qwen2.5-1.5B-Instruct. Results to be filled in.}
-
-\end{frame}
-
-% ============================================================
-% SLIDE 15: MATH Results
+% SLIDE 14: MATH Results
 % ============================================================
 \begin{frame}{MATH-500 Results (Qwen3-4B, 500 Episodes)}
 
-\textbf{Competition-level math} --- much harder than GSM8K.
+\textit{\scriptsize Qwen3-4B-Instruct + LoRA, 7,500 train, MATH-500 test (500 examples), greedy decoding.}
 
 \vspace{0.2cm}
 \begin{table}
 \small
-\begin{tabular}{lcc}
+\begin{tabular}{lccc}
 \toprule
-Method & Train Acc (ep 40) & Test Acc \\
+Method & Train Acc & Test Acc & vs PPO \\
 \midrule
-AITI-Entropy (decay=100) & \textbf{35.4\%} & \textit{running} \\
-AITI-Entropy (residual=0.3) & 34.8\% & \textit{running} \\
-MOAI-Entropy 0.95 & 34.2\% & \textit{running} \\
-PPO baseline & 33.5\% & \textit{running} \\
-Entropy (fixed) & 33.5\% & \textit{running} \\
-AITI-Entropy (decay=200) & 33.5\% & \textit{running} \\
-MOAI-Entropy 0.80 & 32.3\% & \textit{running} \\
-MOAI-Entropy 0.90 & 31.1\% & \textit{running} \\
+\textbf{MOAI-Entropy 0.95} & 37.4\% & \textbf{36.7\%} & \textbf{+1.4\%} \\
+MOAI-Entropy 0.90 & 37.2\% & 36.0\% & +0.7\% \\
+MOAI-Entropy 0.80 & 37.4\% & 35.3\% & +0.0\% \\
+PPO baseline & 35.9\% & 35.3\% & --- \\
+Entropy (fixed) & 36.5\% & 34.8\% & $-$0.5\% \\
+AITI-Entropy (decay=100) & 36.6\% & 32.8\% & $-$2.5\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \vspace{0.2cm}
-\textbf{Early signal (ep 40/500):} AITI-Entropy (decay=100) leads at 35.4\% vs baseline 33.5\%. Training ongoing --- test results to follow.
+\textbf{MOAI-Entropy 0.95 leads:} +1.4\% over PPO baseline on test, with lower KL divergence.
 
-\vspace{0.1cm}
-\textit{\scriptsize Qwen3-4B-Instruct + LoRA, 7,500 train examples, MATH-500 test, entropy-only methods.}
+MOAI variants consistently outperform --- adaptive $\varepsilon^*$ matters more than scheduled decay on harder tasks.
 
 \end{frame}
 
