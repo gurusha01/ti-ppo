@@ -81,12 +81,14 @@ Works well for DPO: +2--5\% on preference benchmarks.
 % ============================================================
 \begin{frame}{Our First Step: Port TI-DPO Methods to PPO}
 
-We weight the PPO clipped surrogate per-token:
+We use the \textbf{same importance scores} from TI-DPO as per-token weights in the PPO loss:
 \[
 \mathcal{L} = \frac{1}{T}\sum_t \alert{w(t)} \cdot \min\!\bigl(r_t \hat{A}_t,\;\text{clip}(r_t)\hat{A}_t\bigr)
 \]
 
-\vspace{0.2cm}
+where $w(t)$ is one of the paper's scores: \textbf{gradient norm} $\|\nabla_{\text{emb}_t}\|_1$, \textbf{attention} received, or the \textbf{hybrid} (gradient + Gaussian prior).
+
+\vspace{0.3cm}
 \textbf{But there is a key difference between DPO and PPO:}
 
 \begin{columns}
@@ -95,7 +97,7 @@ We weight the PPO clipped surrogate per-token:
 \begin{itemize}
     \item Paired (chosen, rejected) sequences
     \item Single pass over data
-    \item Token importance = ``which tokens differ?''
+    \item These scores measure ``which tokens differ between chosen/rejected?''
 \end{itemize}
 \end{column}
 \begin{column}{0.48\textwidth}
@@ -103,13 +105,10 @@ We weight the PPO clipped surrogate per-token:
 \begin{itemize}
     \item Single sequence + scalar reward
     \item Hundreds of gradient steps
-    \item No contrastive signal for importance
+    \item No contrastive pair $\Rightarrow$ gradient/attention scores have no clear meaning
 \end{itemize}
 \end{column}
 \end{columns}
-
-\vspace{0.3cm}
-\textbf{Result:} The paper's gradient/attention methods \alert{underperform} vanilla PPO when ported directly. The DPO-derived signals don't transfer.
 
 \end{frame}
 

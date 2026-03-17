@@ -22,14 +22,19 @@ SLIDE 2: Prior Work — TI-DPO
 
 SLIDE 3: Our First Step — Port to PPO
 ---------------------------------------
-- Natural first idea: take TI-DPO's methods and plug them into PPO.
-- But PPO is fundamentally different. No contrastive pairs. Just one
-  sequence and a scalar reward. The gradient/attention signals from
-  DPO don't have the same meaning here.
-- Also: PPO is online with hundreds of gradient steps, so any systematic
-  error in the weights accumulates. DPO is a single pass.
-- Result: the paper's methods actually hurt. Hybrid+Triplet gets 8%
-  less reward than vanilla PPO.
+- Natural first idea: take TI-DPO's exact importance scores and use them
+  as per-token weights in PPO. So w(t) = gradient norm, or attention
+  received, or the hybrid score — the same signals from the paper.
+- Explain what these scores mean: gradient norm measures how much the
+  embedding at that position contributes to the loss. Attention measures
+  how much other tokens "look at" this token. Hybrid smooths the gradient
+  with a Gaussian prior.
+- But in DPO these scores have a clear interpretation: they tell you
+  which tokens differ between the chosen and rejected response. In PPO
+  there's no rejected response — just one sequence and a scalar reward.
+  So gradient/attention scores don't have the same meaning.
+- Also: PPO runs for hundreds of gradient steps, so any systematic error
+  in the weights accumulates. DPO is a single pass — bias can't compound.
 
 SLIDE 4: Phase 1 Results
 -------------------------
