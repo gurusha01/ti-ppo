@@ -14,7 +14,7 @@
 \title{Entropy-Guided Token Importance for PPO}
 \subtitle{Adaptive Intensity Weighting for Math Reasoning}
 \author{Gurusha Juneja}
-\date{March 2026}
+\date{CS291K}
 
 \begin{document}
 
@@ -413,16 +413,16 @@ MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-eff
 \vspace{0.2cm}
 \begin{table}
 \small
-\begin{tabular}{lccc}
+\begin{tabular}{lccl}
 \toprule
 Method & Train Acc & Test Acc & vs PPO \\
 \midrule
-\textbf{MOAI-Entropy 0.95} & 37.4\% & \textbf{36.7\%} & \textbf{+1.4\%} \\
+\textbf{MOAI-Entropy 0.95} & \textbf{37.4}\% & \textbf{36.7\%} & \textbf{+1.4\%} \\
 MOAI-Entropy 0.90 & 37.2\% & 36.0\% & +0.7\% \\
 MOAI-Entropy 0.80 & 37.4\% & 35.3\% & +0.0\% \\
 PPO baseline & 35.9\% & 35.3\% & --- \\
 Entropy (fixed) & 36.5\% & 34.8\% & $-$0.5\% \\
-AITI-Entropy (decay=100) & 36.6\% & 32.8\% & $-$2.5\% \\
+AITI-Entropy (decay=100) & 36.6\% & 32.8\% & $-$2.5\% (overfitting) \\
 \bottomrule
 \end{tabular}
 \end{table}
