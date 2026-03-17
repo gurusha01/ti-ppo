@@ -209,7 +209,7 @@ Confident \& \textbf{wrong} (``52'' not ``105'') & small & low & Yes, but gradie
 \end{center}
 
 \vspace{0.3cm}
-$\nabla\log\pi$ reflects \textit{how much the output would change} --- not \textit{where a change would help}.
+$\nabla\log\pi$ reflects \textit{how much the output would change}, but the signal is weak.
 
 \vspace{0.3cm}
 Entropy adds what the gradient lacks: \textbf{which tokens are at a decision boundary} where a small update can tip the model toward the right answer.
@@ -238,14 +238,14 @@ PPO baseline & 0.791 & \textbf{0.850} & \textcolor{good}{$\uparrow$} \\
 \textbf{+10\% ahead at ep 100} $\longrightarrow$ \textbf{surpassed by ep 150}
 
 \vspace{0.3cm}
-The weights stay fixed, but the model changes. Tokens that were uncertain early may no longer be the right ones to focus on --- the fixed weights become stale and the error accumulates.
+The weight for each token remains relatively the same as training progresses. Tokens that were uncertain early may no longer be the right ones to focus on.
 
 \end{frame}
 
 % ============================================================
 % SLIDE 8: Why degradation happens
 % ============================================================
-\begin{frame}{Why Do Fixed Weights Degrade?}
+\begin{frame}{Why Does Fixed Weights Degrade?}
 
 \textbf{The gradient estimator with entropy weights $w(t)$ is biased:}
 \[
