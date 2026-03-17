@@ -470,24 +470,28 @@ At bs=1, entropy methods give +4--5\% over baseline. At bs=8, the gap vanishes. 
 
 \vspace{0.2cm}
 \begin{table}
-\begin{tabular}{lccc}
+\small
+\begin{tabular}{lcc}
 \toprule
-Method & Train Acc & Test Acc & vs PPO \\
+Method & Train Acc (ep 40) & Test Acc \\
 \midrule
-PPO baseline & -- & -- & --- \\
-Entropy (fixed) & -- & -- & -- \\
-AITI-Entropy (decay=200) & -- & -- & -- \\
-AITI-Entropy (decay=100) & -- & -- & -- \\
-MOAI-Entropy 0.80 & -- & -- & -- \\
-MOAI-Entropy 0.90 & -- & -- & -- \\
-MOAI-Entropy 0.95 & -- & -- & -- \\
-AITI-Entropy (residual=0.3) & -- & -- & -- \\
+AITI-Entropy (decay=100) & \textbf{35.4\%} & \textit{running} \\
+AITI-Entropy (residual=0.3) & 34.8\% & \textit{running} \\
+MOAI-Entropy 0.95 & 34.2\% & \textit{running} \\
+PPO baseline & 33.5\% & \textit{running} \\
+Entropy (fixed) & 33.5\% & \textit{running} \\
+AITI-Entropy (decay=200) & 33.5\% & \textit{running} \\
+MOAI-Entropy 0.80 & 32.3\% & \textit{running} \\
+MOAI-Entropy 0.90 & 31.1\% & \textit{running} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \vspace{0.2cm}
-\textit{Currently running: Qwen3-4B-Instruct, 500 episodes, 7,500 training examples, entropy-only methods. Results to be filled in.}
+\textbf{Early signal (ep 40/500):} AITI-Entropy (decay=100) leads at 35.4\% vs baseline 33.5\%. Training ongoing --- test results to follow.
+
+\vspace{0.1cm}
+\textit{\scriptsize Qwen3-4B-Instruct + LoRA, 7,500 train examples, MATH-500 test, entropy-only methods.}
 
 \end{frame}
 
