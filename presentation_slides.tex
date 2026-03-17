@@ -450,7 +450,8 @@ All methods improve by $\sim$8\% over the base model. The differences between me
 \textbf{Batch size matters:}
 
 \begin{center}
-\includegraphics[width=\textwidth]{plots/gsm8k_batchsize_sweep.png}
+\vspace{0.5cm}
+\fbox{\parbox{0.85\textwidth}{\centering\vspace{1.5cm}\textit{Batch size sweep figure}\\\textit{(to be updated)}\vspace{1.5cm}}}
 \end{center}
 
 \scriptsize
@@ -463,33 +464,30 @@ At bs=1, entropy methods give +4--5\% over baseline. At bs=8, the gap vanishes. 
 % ============================================================
 % SLIDE 15: MATH Results
 % ============================================================
-\begin{frame}{MATH-500 Results}
+\begin{frame}{MATH-500 Results (Qwen3-4B, 500 Episodes)}
 
 \textbf{Competition-level math} --- much harder than GSM8K.
 
 \vspace{0.2cm}
 \begin{table}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccc}
 \toprule
 Method & Train Acc & Test Acc & vs PPO \\
 \midrule
-MOAI-Entropy 0.90 & 28.0\% & 31.4\% & $-$0.2\% \\
-PPO baseline & 24.0\% & 31.6\% & --- \\
-AITI-Entropy & 27.8\% & 31.6\% & +0.0\% \\
+PPO baseline & -- & -- & --- \\
+Entropy (fixed) & -- & -- & -- \\
+AITI-Entropy (decay=200) & -- & -- & -- \\
+AITI-Entropy (decay=100) & -- & -- & -- \\
+MOAI-Entropy 0.80 & -- & -- & -- \\
+MOAI-Entropy 0.90 & -- & -- & -- \\
+MOAI-Entropy 0.95 & -- & -- & -- \\
+AITI-Entropy (residual=0.3) & -- & -- & -- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \vspace{0.2cm}
-\textbf{Observations:}
-\begin{itemize}
-    \item Entropy methods show \textbf{+4\% higher training accuracy} (28\% vs 24\%)
-    \item But test gap is small --- PPO itself only improves $\sim$1.6\% over the base model
-    \item With so little total improvement, there's limited room for entropy to add on top
-\end{itemize}
-
-\vspace{0.2cm}
-\textbf{Currently running:} Qwen3-4B model, 500 episodes, 7,500 training examples. With a stronger model and more training, we expect clearer differentiation. \textit{(Results to be updated.)}
+\textit{Currently running: Qwen3-4B-Instruct, 500 episodes, 7,500 training examples, entropy-only methods. Results to be filled in.}
 
 \end{frame}
 
