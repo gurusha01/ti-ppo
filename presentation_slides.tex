@@ -192,6 +192,41 @@ Entropy naturally identifies \textbf{decision points} --- tokens where the model
 \end{frame}
 
 % ============================================================
+% SLIDE 6b: Why not just rely on grad log pi?
+% ============================================================
+\begin{frame}{Wait --- Doesn't $\nabla\log\pi$ Already Contain This Information?}
+
+The policy gradient is $g = \sum_t \nabla\log\pi(a_t|s_t) \cdot \hat{A}_t$. Doesn't $\nabla\log\pi$ itself tell us which tokens matter?
+
+\vspace{0.3cm}
+\textbf{Not quite.} $\nabla\log\pi(a_t|s_t)$ tells us the direction to make token $a_t$ more likely. But:
+
+\begin{itemize}
+    \item It does \textbf{not} tell us whether updating this token is \textbf{useful for the reward}
+    \item A confident token (``the'') has a small $\|\nabla\log\pi\|$ --- but so does a token where the model is confidently \textit{wrong}
+    \item The gradient magnitude reflects \textbf{how much the output would change}, not \textbf{how much the reward cares}
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Entropy adds orthogonal information:}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Token type & $\|\nabla\log\pi\|$ & $H(\pi)$ \\
+\midrule
+Confident \& correct (``the'') & small & low \\
+Confident \& wrong (``52'' instead of ``105'') & small & low \\
+\alert{Uncertain decision point (``='' before answer)} & medium & \alert{high} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Entropy identifies tokens where the model \textit{could go either way} --- exactly where a gradient update has the most leverage.
+
+\end{frame}
+
+% ============================================================
 % SLIDE 7: Early results with entropy
 % ============================================================
 \begin{frame}{Entropy Weighting: Promising Early Results}
@@ -380,35 +415,6 @@ MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-eff
 
 \end{frame}
 
-% ============================================================
-% SLIDE 13: Implementation
-% ============================================================
-\begin{frame}{Implementation: Getting the Pipeline Right}
-
-\textbf{Setup:} Qwen2.5-1.5B-Instruct + LoRA, GSM8K and MATH benchmarks.
-
-\vspace{0.2cm}
-\textbf{Critical bugs we discovered and fixed:}
-
-\begin{enumerate}
-    \item \alert{Value head in fp16} --- gradient norm of 4.2 caused NaN overflow after 1 update.
-
-    Fix: float32 value head.
-    \item \alert{Log-softmax in fp16} --- KL between policy and reference was always 0.0 (underflow).
-
-    Fix: float32 upcast before log\_softmax.
-    \item \alert{No chat template} --- model got 55\% on GSM8K instead of published 68\%.
-
-    Fix: use \texttt{apply\_chat\_template} for Qwen instruct models (+12\% accuracy).
-    \item \alert{Small training pool} --- 500 questions caused severe overfitting (test < base model).
-
-    Fix: use full training set (7,473 for GSM8K, 7,500 for MATH).
-\end{enumerate}
-
-\vspace{0.2cm}
-Without these fixes, no method (including baseline PPO) shows meaningful learning.
-
-\end{frame}
 
 % ============================================================
 % SLIDE 14: GSM8K Results

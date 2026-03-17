@@ -72,6 +72,27 @@ SLIDE 6: Entropy Intuition
 - Ask the audience: if you could only update the model on one token,
   which would you pick? Entropy identifies the answer automatically.
 
+SLIDE 6b: Doesn't grad log pi already contain this?
+---------------------------------------------------
+- This is the natural pushback. Someone in the audience will think:
+  "the gradient itself should encode which tokens matter."
+- The key distinction: grad log pi tells you the DIRECTION to update
+  to make that token more likely. It doesn't tell you whether updating
+  that token is USEFUL.
+- Example: a token where the model is confidently wrong (says "52"
+  when the answer is "105") has SMALL grad log pi (model is confident)
+  AND low entropy. The gradient won't fix it.
+- But a token where the model is uncertain (could say "105" or "52"
+  with similar probability) has HIGH entropy. The gradient at this
+  token has LEVERAGE — a small update can tip the model toward the
+  right answer.
+- So entropy adds information that the gradient doesn't have: which
+  tokens are at a decision boundary where an update actually matters.
+- Another way to think about it: entropy weighting is like adaptive
+  step sizes per token. We take bigger steps where the model is
+  uncertain (likely to benefit) and smaller steps where it's confident
+  (less to gain, risk of undoing what's already learned).
+
 SLIDE 7: Early Results — Entropy Works... Then Doesn't
 -------------------------------------------------------
 - Show the table: entropy weighting is +10% at episode 100. Great!
