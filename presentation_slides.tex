@@ -40,55 +40,23 @@ Standard PPO treats every token equally in the policy gradient:
 \vspace{0.3cm}
 \textbf{Question:} Can we weight tokens by importance to get \textit{faster learning} and \textit{lower KL divergence}?
 
-\vspace{0.3cm}
-\textbf{TI-DPO} (Yang et al., 2025) showed this works for DPO. \textbf{Does it transfer to PPO?}
 \end{frame}
 
 % ============================================================
-% SLIDE 2: Why This Is Hard
+% SLIDE 2: TI-DPO Background
 % ============================================================
-\begin{frame}{Why This Is Harder Than It Looks}
-
-\textbf{DPO vs PPO --- a fundamental difference:}
-
-\begin{columns}
-\begin{column}{0.48\textwidth}
-\textbf{DPO (offline)}
-\begin{itemize}
-    \item Paired (chosen, rejected) sequences
-    \item Single pass over data
-    \item Bias doesn't accumulate
-    \item Token importance = ``which tokens differ between chosen/rejected?''
-\end{itemize}
-\end{column}
-\begin{column}{0.48\textwidth}
-\textbf{PPO (online)}
-\begin{itemize}
-    \item Single sequence + scalar reward
-    \item Hundreds of gradient steps
-    \item \alert{Bias accumulates over training}
-    \item Token importance = ??? (no contrastive signal)
-\end{itemize}
-\end{column}
-\end{columns}
-
-\vspace{0.5cm}
-Importance weighting introduces a \alert{persistent bias} in the PPO gradient that compounds over training steps.
-
-\end{frame}
-
-% ============================================================
-% SLIDE 3: TI-DPO Background
-% ============================================================
-\begin{frame}{Background: TI-DPO (Yang et al., 2025)}
+\begin{frame}{Prior Work: TI-DPO (Yang et al., 2025)}
 
 Token-Importance guided DPO weights the preference loss per-token:
 \[
 \mathcal{L}_{\text{TI-DPO}} = -\log\sigma\!\Bigl(\beta\sum_t \alert{w(t)}\bigl[\log\pi(a_t^w|s_t) - \log\pi(a_t^\ell|s_t)\bigr]\Bigr)
 \]
 
+\vspace{0.3cm}
+
 \textbf{Their importance scoring methods:}
 
+\vspace{0.2cm}
 \begin{table}
 \small
 \begin{tabular}{lll}
@@ -103,42 +71,99 @@ TD Error & $|V(s_t) - V(s_{t+1}) - r_t|$ & Free \\
 \end{tabular}
 \end{table}
 
+\vspace{0.2cm}
 Works well for DPO: +2--5\% on preference benchmarks.
 
-\textbf{Our goal:} Adapt this to PPO for math reasoning (GSM8K, MATH).
-
 \end{frame}
 
 % ============================================================
-% SLIDE 4: Why Entropy (not Advantage)
+% SLIDE 3: Our first step --- port to PPO
 % ============================================================
-\begin{frame}{Why Entropy, Not Advantage?}
+\begin{frame}{Our First Step: Port TI-DPO Methods to PPO}
 
-\textbf{Advantage is meaningless for per-token importance in LLM PPO:}
-\begin{itemize}
-    \item Reward is a \textbf{single scalar} assigned at the last token
-    \item GAE propagates it backwards: $\hat{A}_t = (0.95)^{T-t} \cdot R$
-    \item This is just \textbf{positional decay} --- not a content signal
-    \item Weighting by $|\hat{A}_t|$ = ``weight later tokens more'' $\to$ meaningless
-\end{itemize}
-
-\vspace{0.3cm}
-\textbf{Entropy is a genuine content-based signal:}
+We weight the PPO clipped surrogate per-token:
 \[
-w(t) = \frac{H\bigl(\pi(\cdot | s_t)\bigr)}{\text{mean}(H)}, \qquad H(\pi) = -\sum_v \pi(v) \log \pi(v)
+\mathcal{L} = \frac{1}{T}\sum_t \alert{w(t)} \cdot \min\!\bigl(r_t \hat{A}_t,\;\text{clip}(r_t)\hat{A}_t\bigr)
 \]
 
+\vspace{0.2cm}
+\textbf{But there is a key difference between DPO and PPO:}
+
+\begin{columns}
+\begin{column}{0.48\textwidth}
+\textbf{DPO (offline)}
 \begin{itemize}
-    \item \textbf{High entropy} $\to$ model is uncertain $\to$ multiple plausible continuations $\to$ \textcolor{good}{room to learn}
-    \item \textbf{Low entropy} $\to$ model is confident $\to$ one dominant token $\to$ less to gain
+    \item Paired (chosen, rejected) sequences
+    \item Single pass over data
+    \item Token importance = ``which tokens differ?''
+\end{itemize}
+\end{column}
+\begin{column}{0.48\textwidth}
+\textbf{PPO (online)}
+\begin{itemize}
+    \item Single sequence + scalar reward
+    \item Hundreds of gradient steps
+    \item No contrastive signal for importance
+\end{itemize}
+\end{column}
+\end{columns}
+
+\vspace{0.3cm}
+\textbf{Result:} The paper's gradient/attention methods \alert{underperform} vanilla PPO when ported directly. The DPO-derived signals don't transfer.
+
+\end{frame}
+
+% ============================================================
+% SLIDE 4: Results after Phase 1
+% ============================================================
+\begin{frame}{Phase 1 Results: Direct Port Fails}
+
+\begin{table}
+\begin{tabular}{lccc}
+\toprule
+Method & Reward (Q4) & KL (Q4) & KL-Efficiency \\
+\midrule
+PPO baseline (uniform) & \textbf{0.850} & 0.043 & 19.9 \\
+Paper: Hybrid+Triplet & 0.779 & 0.024 & 32.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{0.3cm}
+The hybrid method is KL-efficient (low divergence) but achieves \textbf{8.4\% less reward} than vanilla PPO.
+
+\vspace{0.3cm}
+\textbf{Takeaway:} We need importance signals that are native to the PPO setting, not borrowed from DPO.
+
+\end{frame}
+
+% ============================================================
+% SLIDE 5: Entropy as importance
+% ============================================================
+\begin{frame}{Our Idea: Use Entropy as a Token Importance Signal}
+
+\textbf{Per-token policy entropy} measures the model's uncertainty at each position:
+\[
+H\bigl(\pi(\cdot | s_t)\bigr) = -\sum_v \pi(v|s_t) \log \pi(v|s_t)
+\]
+
+We normalize and use it as an importance weight in the PPO loss:
+\[
+w(t) = \frac{H(t)}{\frac{1}{T}\sum_{t'} H(t')} \qquad \Longrightarrow \qquad \mathcal{L} = \frac{1}{T}\sum_t \alert{w(t)} \cdot \min(r_t \hat{A}_t,\;\text{clip}(r_t)\hat{A}_t)
+\]
+
+\textbf{Why entropy?}
+\begin{itemize}
+    \item \textbf{High entropy} = model sees multiple plausible next tokens = \textcolor{good}{decision point, room to learn}
+    \item \textbf{Low entropy} = model is confident, one dominant choice = less to gain from updates
     \item \textbf{Free:} computed from existing logits, zero extra cost
-    \item \textbf{Content-aware:} varies based on what the token \textit{means}, not its position
+    \item \textbf{Content-aware:} depends on \textit{what} the token means, not \textit{where} it is
 \end{itemize}
 
 \end{frame}
 
 % ============================================================
-% SLIDE 5: Entropy Intuition
+% SLIDE 6: Entropy intuition
 % ============================================================
 \begin{frame}{Entropy Intuition: Where Should the Model Focus?}
 
@@ -152,10 +177,9 @@ Token & $H(\pi)$ & Interpretation \\
 \midrule
 ``Let'' & 0.2 & Boilerplate --- model is sure \\
 ``me'' & 0.1 & Continuation is obvious \\
-``calculate'' & 0.8 & \textbf{Multiple valid reasoning strategies} \\
+``calculate'' & 0.8 & Multiple valid reasoning strategies \\
 ``15'' & 0.3 & Copying from the problem \\
 ``$\times$'' & 0.1 & Determined by context \\
-``7'' & 0.2 & Copying from the problem \\
 ``='' & \alert{1.4} & \textbf{Critical: model must compute the answer!} \\
 ``105'' & \alert{1.2} & \textbf{The actual answer --- high uncertainty} \\
 ``.'' & 0.1 & Punctuation \\
@@ -164,108 +188,100 @@ Token & $H(\pi)$ & Interpretation \\
 \end{center}
 
 \vspace{0.2cm}
-Entropy naturally identifies \textbf{decision points} where the model's choice matters most for correctness. These are exactly the tokens where PPO's gradient signal is most valuable.
+Entropy naturally identifies \textbf{decision points} --- tokens where the model's choice determines correctness. PPO's gradient is most useful precisely at these positions.
 \end{frame}
 
 % ============================================================
-% SLIDE 6: The Degradation
+% SLIDE 7: Early results with entropy
 % ============================================================
-\begin{frame}{The Catch: Fixed-Intensity Entropy Weighting Degrades}
+\begin{frame}{Entropy Weighting: Promising Early Results}
 
-\textbf{At 150 episodes, the picture reverses:}
+We apply entropy weights to the PPO loss (``entropy weighting'') and train for 150 episodes:
 
+\vspace{0.2cm}
 \begin{table}
-\small
 \begin{tabular}{lccc}
 \toprule
 Method & R(Q4) at ep 100 & R(Q4) at ep 150 & Trend \\
 \midrule
+\textbf{Entropy-weighted PPO} & \textbf{0.872} & 0.797 & \textcolor{bad}{$\downarrow$ degraded} \\
 PPO baseline & 0.791 & \textbf{0.850} & $\uparrow$ keeps improving \\
-Entropy (fixed) & \textbf{0.872} & 0.797 & \textcolor{bad}{$\downarrow$ degraded} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \vspace{0.3cm}
-\textbf{Why?} Early in training, high-entropy tokens are genuinely uncertain decision points. But as the model learns:
-\begin{itemize}
-    \item Entropy landscape shifts --- high-entropy tokens become random noise, not meaningful uncertainty
-    \item The biased gradient accumulates: over-updating some tokens, under-updating others
-    \item Result: reward plateaus then declines
-\end{itemize}
+At episode 100, entropy weighting is \textbf{+10\% ahead}. But by episode 150, baseline has caught up and surpassed it.
 
-\vspace{0.2cm}
-This is a \alert{fundamental property} of non-uniform weighting in online policy gradient, not a bug.
+\vspace{0.3cm}
+\textbf{What happened?} The entropy weights stay fixed throughout training, but the model is changing. The tokens that were uncertain early on may no longer be the right ones to focus on later. The fixed weights become stale and introduce a systematic error that accumulates over gradient steps.
+
 \end{frame}
 
 % ============================================================
-% SLIDE 7: The Math --- Bias-Variance Tradeoff
+% SLIDE 8: Why degradation happens
 % ============================================================
-\begin{frame}{The Key Insight: Bias-Variance Tradeoff}
+\begin{frame}{Why Do Fixed Weights Degrade?}
 
-The PPO gradient with importance weights:
+\textbf{The gradient estimator with entropy weights $w(t)$ is biased:}
 \[
-g_w = \mathbb{E}_t\bigl[w(t) \cdot \nabla\log\pi(a_t|s_t) \cdot \hat{A}_t\bigr]
+g_w = \mathbb{E}_t\bigl[w(t) \cdot \nabla\log\pi(a_t|s_t) \cdot \hat{A}_t\bigr], \qquad \text{Bias} = \text{Cov}(w, f) \neq 0
 \]
 
-\textbf{Bias of this estimator:}
-\[
-\text{Bias} = \mathbb{E}[g_w] - \mathbb{E}[g] = \text{Cov}(w, f) \neq 0
-\]
-where $f = \nabla\log\pi \cdot \hat{A}$.
+This bias is small per step, but it \textbf{accumulates} over hundreds of PPO updates.
 
 \vspace{0.3cm}
-
 \begin{columns}
 \begin{column}{0.48\textwidth}
-\textbf{Early training:}
-\[
-\underbrace{\text{Var}(g)}_{\text{large}} \gg \underbrace{|\text{Bias}|}_{\text{small}}
-\]
-Entropy weighting reduces variance $\to$ \textcolor{good}{helps}
+\textbf{Early in fine-tuning:}
+\begin{itemize}
+    \item Gradient variance is high (policy still adapting)
+    \item Entropy weights reduce this variance by focusing on informative tokens
+    \item Net effect: \textcolor{good}{faster learning}
+\end{itemize}
 \end{column}
 \begin{column}{0.48\textwidth}
-\textbf{Late training:}
-\[
-\underbrace{|\text{Bias}|}_{\text{accumulated}} \gg \underbrace{\text{Var}(g)}_{\text{small}}
-\]
-Bias dominates $\to$ \textcolor{bad}{hurts}
+\textbf{Later in fine-tuning:}
+\begin{itemize}
+    \item Gradient variance is lower (policy stabilizing)
+    \item But accumulated bias from fixed weights distorts the gradient direction
+    \item Net effect: \textcolor{bad}{wrong updates, reward declines}
+\end{itemize}
 \end{column}
 \end{columns}
 
 \vspace{0.3cm}
-Explains why TI-DPO works (offline, no accumulation) but fixed TI-PPO fails (online, compounds).
+Even though the base model is pretrained and capable, the RL fine-tuning process itself has early/late dynamics --- the policy changes most in the first few hundred PPO steps.
 
 \end{frame}
 
 % ============================================================
-% SLIDE 8: Our Solution --- AITI
+% SLIDE 9: AITI
 % ============================================================
-\begin{frame}{Our Solution: Adaptive Intensity Token Importance (AITI)}
+\begin{frame}{Solution: Adaptive Intensity Token Importance (AITI)}
 
-\textbf{Decay the entropy-weighting intensity over training:}
+\textbf{Decay the entropy-weighting intensity as training progresses:}
 \[
 w_{\text{AITI}}(t) = 1 + \alert{\varepsilon(\text{step})} \cdot \bigl(H(t)_{\text{norm}} - 1\bigr)
 \]
 
 \begin{itemize}
-    \item $H(t)_{\text{norm}}$ = normalized per-token entropy (mean $\approx 1$)
-    \item $\varepsilon$ decays from 1 $\to$ 0 (or to a residual minimum)
-    \item $\varepsilon = 1$: full entropy weighting (maximum variance reduction)
-    \item $\varepsilon = 0$: uniform PPO (zero bias)
+    \item $\varepsilon = 1$: full entropy weighting (focus on uncertain tokens)
+    \item $\varepsilon = 0$: uniform PPO (all tokens equal)
+    \item $\varepsilon$ decays linearly over a configurable number of steps
 \end{itemize}
 
 \vspace{0.3cm}
-\textbf{Analogy:} Learning rate scheduling controls \textit{step size}. AITI controls \textit{gradient quality}.
+\textbf{Analogy:} Learning rate scheduling controls \textit{step size}. AITI controls \textit{where} the gradient focuses.
 
 \begin{table}
 \small
 \begin{tabular}{lcc}
 \toprule
-Phase & Learning Rate & AITI Intensity ($\varepsilon$) \\
+Fine-tuning phase & Learning Rate & AITI Intensity ($\varepsilon$) \\
 \midrule
-Early & High (explore) & High (focus on uncertain tokens) \\
-Late & Low (fine-tune) & Low (unbiased gradients for all tokens) \\
+Early (policy adapting) & High & High (focus on uncertain tokens) \\
+Late (policy stabilizing) & Low & Low (equal treatment, no bias) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -273,244 +289,264 @@ Late & Low (fine-tune) & Low (unbiased gradients for all tokens) \\
 \end{frame}
 
 % ============================================================
-% SLIDE 9: MOAI
+% SLIDE 10: AITI results
 % ============================================================
-\begin{frame}{MOAI: MSE-Optimal Adaptive Intensity}
-
-Instead of a hand-tuned decay schedule, \textbf{compute optimal $\varepsilon^*$ per step}:
-
-\[
-\varepsilon^* = \arg\min_\varepsilon\; \text{MSE}(g_\varepsilon) = \arg\min_\varepsilon\; \bigl[\text{Bias}(\varepsilon)^2 + \text{Var}(\varepsilon)\bigr]
-\]
-
-\textbf{Closed-form solution} (with monotone constraint $\varepsilon^* \leq \varepsilon^*_{\text{prev}}$):
-
-\[
-\varepsilon^* = \text{clip}\!\left(\frac{-C}{2\rho},\; 0,\; \varepsilon_{\text{prev}}\right)
-\]
-
-where $C = \text{Cov}(H_{\text{norm}}, f)$ and $\rho = \text{Var}(H_{\text{norm}}) \cdot \mathbb{E}[f^2]$, estimated via EMA.
-
-\vspace{0.3cm}
-\textbf{Key discovery:} MOAI converges to $\varepsilon^* \approx 0.3$--$0.5$, \textit{not} zero.
-
-$\Rightarrow$ The optimal strategy is \textbf{permanent partial entropy weighting}, not full decay.
-
-The model always benefits from some focus on uncertain tokens.
-
-\end{frame}
-
-% ============================================================
-% SLIDE 10: Synthetic Results
-% ============================================================
-\begin{frame}{Results: Synthetic Reward Benchmark}
+\begin{frame}{AITI Results: Entropy Weighting That Doesn't Degrade}
 
 \begin{table}
-\small
 \begin{tabular}{lcccc}
 \toprule
 Method & Reward (Q4) & KL (Q4) & KL-Efficiency & Pareto? \\
 \midrule
-\textbf{MOAI-Entropy mono} & \textbf{0.880} & 0.056 & 15.7 & \textcolor{good}{\textbf{YES}} \\
-\textbf{AITI-Entropy} & 0.855 & \textbf{0.016} & \textbf{54.1} & \textcolor{good}{\textbf{YES}} \\
-PPO baseline & 0.859 & 0.028 & 30.4 & YES \\
-TI-DPO Hybrid+Triplet & 0.779 & 0.024 & 32.7 & dominated \\
-Entropy (fixed, no decay) & 0.797 & -0.504 & 1.6 & dominated \\
+\textbf{AITI-Entropy} & \textbf{0.855} & \textbf{0.016} & \textbf{54.1} & \textcolor{good}{\textbf{YES}} \\
+PPO baseline & 0.818 & 0.040 & 20.4 & dominated \\
+Entropy (fixed, no decay) & 0.815 & $-$0.611 & 1.3 & dominated \\
+TI-DPO Hybrid & 0.779 & 0.024 & 32.7 & dominated \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \vspace{0.3cm}
 \begin{itemize}
-    \item MOAI-Entropy: \textbf{highest reward} (+2.4\% over baseline)
-    \item AITI-Entropy: \textbf{best KL-efficiency} (54.1 vs 30.4)
-    \item Both \textbf{Pareto-dominate} uniform PPO
-    \item Fixed entropy (no decay) \textbf{dominated} --- confirms the bias-variance theory
+    \item AITI-Entropy \textbf{Pareto-dominates} PPO: higher reward \textit{and} 2.5$\times$ lower KL
+    \item Fixed entropy degrades as predicted (negative KL = policy drifted \textit{toward} reference)
+    \item The decay schedule is what makes entropy weighting viable in PPO
 \end{itemize}
 
 \end{frame}
 
 % ============================================================
-% SLIDE 11: GSM8K Setup + Results
+% SLIDE 11: MOAI motivation
 % ============================================================
-\begin{frame}{GSM8K: Grade-School Math (1.5B Model)}
+\begin{frame}{Can We Pick the Optimal $\varepsilon$ Automatically?}
 
-\begin{columns}
-\begin{column}{0.52\textwidth}
-\textbf{Setup:}
+AITI requires choosing a decay schedule: how many steps? Linear or quadratic?
+
+\vspace{0.2cm}
+\textbf{Idea:} At each step, pick $\varepsilon$ to minimize the \textbf{mean squared error} of the gradient estimator:
+\[
+\text{MSE}(g_\varepsilon) = \underbrace{\text{Bias}(\varepsilon)^2}_{\text{worse when } \varepsilon \text{ is large}} + \underbrace{\text{Var}(\varepsilon)}_{\text{worse when } \varepsilon \text{ is small}}
+\]
+
+\vspace{0.1cm}
+Why MSE? The PPO loss uses the gradient $g$ to update the policy. A gradient with lower MSE relative to the true gradient gives better updates. Bias$^2$ + Variance is the standard decomposition of estimation error.
+
+\vspace{0.3cm}
+\textbf{Closed-form solution} (MOAI = MSE-Optimal Adaptive Intensity):
+\[
+\varepsilon^* = \text{clip}\!\left(\frac{-C}{2\rho},\; 0,\; \varepsilon_{\text{prev}}\right)
+\]
+where $C = \text{Cov}(H_{\text{norm}}, f)$ and $\rho = \text{Var}(H_{\text{norm}}) \cdot \mathbb{E}[f^2]$, estimated via exponential moving average.
+
+The monotone constraint ($\varepsilon^* \leq \varepsilon_{\text{prev}}$) ensures intensity only decreases.
+
+\end{frame}
+
+% ============================================================
+% SLIDE 12: MOAI finding
+% ============================================================
+\begin{frame}{MOAI Finding: Partial Weighting Can Be Optimal}
+
+\textbf{Empirical observation:} MOAI converges to $\varepsilon^* \approx 0.3$--$0.5$, not zero.
+
+\vspace{0.2cm}
+This seems to contradict AITI (which decays to 0). But the MSE decomposition explains it:
+
 \begin{itemize}
-    \item Qwen2.5-1.5B-Instruct + LoRA (r=16)
-    \item 7,473 train / 1,319 test
-    \item Binary reward via \textbackslash boxed\{\} extraction
-    \item Chat template (crucial: +12\% accuracy)
-    \item 200 episodes, batch size 4
+    \item AITI decays to $\varepsilon = 0$ to \textbf{eliminate all bias} --- safe but conservative
+    \item MOAI finds that a \textbf{small amount of bias is worth the variance reduction} it buys
+    \item At $\varepsilon \approx 0.3$: the remaining bias$^2$ is tiny, but the variance reduction is still meaningful
 \end{itemize}
 
 \vspace{0.3cm}
-\textbf{Test results (greedy, 1319 examples):}
+\begin{table}
+\begin{tabular}{lcccc}
+\toprule
+Method & Reward (Q4) & KL (Q4) & KL-Eff & Pareto? \\
+\midrule
+\textbf{MOAI-Entropy} & \textbf{0.880} & 0.056 & 15.7 & \textcolor{good}{\textbf{YES}} \\
+AITI-Entropy & 0.855 & \textbf{0.016} & \textbf{54.1} & \textcolor{good}{\textbf{YES}} \\
+PPO baseline & 0.818 & 0.040 & 20.4 & dominated \\
+Entropy (fixed) & 0.815 & $-$0.611 & 1.3 & dominated \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-efficiency}. Both Pareto-dominate PPO.
+
+\end{frame}
+
+% ============================================================
+% SLIDE 13: Implementation
+% ============================================================
+\begin{frame}{Implementation: Getting the Pipeline Right}
+
+\textbf{Setup:} Qwen2.5-1.5B-Instruct + LoRA, GSM8K and MATH benchmarks.
+
+\vspace{0.2cm}
+\textbf{Critical bugs we discovered and fixed:}
+
+\begin{enumerate}
+    \item \alert{Value head in fp16} --- gradient norm of 4.2 caused NaN overflow after 1 update.
+
+    Fix: float32 value head.
+    \item \alert{Log-softmax in fp16} --- KL between policy and reference was always 0.0 (underflow).
+
+    Fix: float32 upcast before log\_softmax.
+    \item \alert{No chat template} --- model got 55\% on GSM8K instead of published 68\%.
+
+    Fix: use \texttt{apply\_chat\_template} for Qwen instruct models (+12\% accuracy).
+    \item \alert{Small training pool} --- 500 questions caused severe overfitting (test < base model).
+
+    Fix: use full training set (7,473 for GSM8K, 7,500 for MATH).
+\end{enumerate}
+
+\vspace{0.2cm}
+Without these fixes, no method (including baseline PPO) shows meaningful learning.
+
+\end{frame}
+
+% ============================================================
+% SLIDE 14: GSM8K Results
+% ============================================================
+\begin{frame}{GSM8K Results (1.5B Model)}
+
+\begin{columns}
+\begin{column}{0.52\textwidth}
+\textbf{Test accuracy (1,319 examples, greedy):}
+
 \begin{table}
 \scriptsize
 \begin{tabular}{lcc}
 \toprule
 Method & Test Acc & vs Base \\
 \midrule
-MOAI-Ent 0.80 & \textbf{63.0\%} & +8.3\% \\
-AITI-Entropy & 62.5\% & +7.8\% \\
 PPO baseline & 63.1\% & +8.4\% \\
+MOAI-Entropy 0.80 & 63.0\% & +8.3\% \\
+AITI-Entropy & 62.5\% & +7.8\% \\
 Entropy (fixed) & 62.7\% & +8.0\% \\
+\hdashline
 Base model & 54.7\% & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\vspace{0.2cm}
+All methods improve by $\sim$8\% over the base model. The differences between methods are small ($<$1\%).
+
+\textbf{Why?} GSM8K is relatively easy for this model --- the base already gets 55\%, leaving limited room for PPO to differentiate methods.
 \end{column}
 \begin{column}{0.46\textwidth}
-\textbf{Key bugs fixed:}
-\begin{enumerate}
-    \scriptsize
-    \item Value head fp16 $\to$ NaN overflow
-    \item Logprobs fp16 $\to$ KL=0 underflow
-    \item No chat template $\to$ 12\% accuracy loss
-    \item Small train pool $\to$ overfitting
-\end{enumerate}
+\textbf{Batch size matters:}
 
-\vspace{0.3cm}
-\textbf{Insight:} On GSM8K, the base model already gets 55\%. PPO improves all methods by +8\%. The entropy methods match baseline --- the task may be too easy for differentiation.
+\begin{center}
+\includegraphics[width=\textwidth]{plots/gsm8k_batchsize_sweep.png}
+\end{center}
+
+\scriptsize
+At bs=1, entropy methods give +4--5\% over baseline. At bs=8, the gap vanishes. Entropy weighting helps most when gradient variance is high.
 \end{column}
 \end{columns}
 
 \end{frame}
 
 % ============================================================
-% SLIDE 12: MATH-500 Results
+% SLIDE 15: MATH Results
 % ============================================================
-\begin{frame}{MATH-500: Competition Math (Harder Task)}
+\begin{frame}{MATH-500 Results}
 
-\textbf{Setup:} Same pipeline, 500 train / 500 test (MATH-500), 100 episodes.
+\textbf{Competition-level math} --- much harder than GSM8K.
 
-\begin{columns}
-\begin{column}{0.52\textwidth}
+\vspace{0.2cm}
 \begin{table}
-\small
-\begin{tabular}{lcc}
+\begin{tabular}{lcccc}
 \toprule
-Method & Test Acc & vs PPO \\
+Method & Train Acc & Test Acc & vs PPO \\
 \midrule
-\textbf{MOAI-Ent 0.90} & \textbf{31.4\%} & $-$0.2\% \\
-PPO baseline & 31.6\% & --- \\
-AITI-Entropy & 31.6\% & +0.0\% \\
-Entropy (fixed) & 31.6\% & +0.0\% \\
+MOAI-Entropy 0.90 & 28.0\% & 31.4\% & $-$0.2\% \\
+PPO baseline & 24.0\% & 31.6\% & --- \\
+AITI-Entropy & 27.8\% & 31.6\% & +0.0\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Methods are tied because \textbf{PPO itself barely improved} over the base model ($\sim$30\%) in only 100 episodes.
-
 \vspace{0.2cm}
-With binary rewards on competition math, most batches get 0/4 correct $\to$ reward signal is extremely sparse.
-\end{column}
-\begin{column}{0.46\textwidth}
-\textbf{Currently running:}
+\textbf{Observations:}
 \begin{itemize}
-    \item Qwen3-4B-Instruct (larger model)
-    \item 500 episodes (5$\times$ more training)
-    \item 7,500 training examples
-    \item Entropy-only methods (8 variants)
+    \item Entropy methods show \textbf{+4\% higher training accuracy} (28\% vs 24\%)
+    \item But test gap is small --- PPO itself only improves $\sim$1.6\% over the base model
+    \item With so little total improvement, there's limited room for entropy to add on top
 \end{itemize}
 
-\vspace{0.3cm}
-With a stronger base model and more training, we expect clearer differentiation between entropy-guided methods and vanilla PPO.
-\end{column}
-\end{columns}
+\vspace{0.2cm}
+\textbf{Currently running:} Qwen3-4B model, 500 episodes, 7,500 training examples. With a stronger model and more training, we expect clearer differentiation. \textit{(Results to be updated.)}
 
 \end{frame}
 
 % ============================================================
-% SLIDE 13: Batch Size Finding
-% ============================================================
-\begin{frame}{When Does Entropy Weighting Help Most?}
-
-\textbf{Batch size sweep (GSM8K, 1.5B model):}
-
-\begin{center}
-\includegraphics[width=0.55\textwidth]{plots/gsm8k_batchsize_sweep.png}
-\end{center}
-
-\begin{itemize}
-    \item At \textbf{bs=1}: entropy methods give \textbf{+4--5\%} over baseline
-    \item At \textbf{bs=4}: gap narrows to $\sim$1\%
-    \item At \textbf{bs=8}: methods converge --- baseline catches up
-\end{itemize}
-
-\vspace{0.2cm}
-\textbf{Conclusion:} Entropy weighting is a \textbf{variance reduction technique}. It helps most when gradient variance is high (small batches, sparse rewards, early training).
-\end{frame}
-
-% ============================================================
-% SLIDE 14: Takeaways
+% SLIDE 16: Takeaways
 % ============================================================
 \begin{frame}{Key Takeaways}
 
 \begin{enumerate}
     \item \textbf{Entropy is the right importance signal for PPO}
     \begin{itemize}
-        \item Advantage is positional (not content-based) with scalar rewards
-        \item Entropy identifies \textit{decision points} where the model is uncertain
-        \item Free to compute from existing logits
+        \item It identifies tokens where the model is uncertain --- decision points
+        \item Free to compute, content-aware, no extra forward/backward passes
     \end{itemize}
 
     \vspace{0.2cm}
-    \item \textbf{Fixed entropy weighting degrades due to bias accumulation}
+    \item \textbf{Fixed entropy weighting degrades over training}
     \begin{itemize}
-        \item $\text{Bias} = \text{Cov}(w, f) \neq 0$, compounds over gradient steps
-        \item Helps early (variance reduction), hurts late (bias dominates)
+        \item Biased gradient estimator: Cov$(w, f) \neq 0$
+        \item Helps early (variance reduction) but hurts late (accumulated bias)
     \end{itemize}
 
     \vspace{0.2cm}
-    \item \textbf{AITI/MOAI solve this with adaptive intensity decay}
+    \item \textbf{AITI and MOAI fix this with adaptive intensity}
     \begin{itemize}
-        \item AITI: scheduled decay $\varepsilon: 1 \to 0$
-        \item MOAI: closed-form optimal $\varepsilon^*$ per step, converges to $\sim$0.3--0.5
+        \item AITI: scheduled decay $\varepsilon: 1 \to 0$ (safe, conservative)
+        \item MOAI: per-step optimal $\varepsilon^*$ via MSE minimization (higher reward, keeps some weighting)
     \end{itemize}
 
     \vspace{0.2cm}
-    \item \textbf{Benefit is strongest in high-variance regimes}
+    \item \textbf{Strongest in high-variance regimes}
     \begin{itemize}
-        \item Small batch sizes, sparse rewards, early training, harder tasks
-        \item A variance reduction technique --- complementary to, not replacing, PPO
+        \item Small batch sizes, sparse rewards, early training
+        \item Entropy weighting is variance reduction for the policy gradient
     \end{itemize}
 \end{enumerate}
 
 \end{frame}
 
 % ============================================================
-% SLIDE 15: Future Work
+% SLIDE 17: Future Work
 % ============================================================
 \begin{frame}{Future Directions}
 
 \begin{columns}
 \begin{column}{0.48\textwidth}
-\textbf{Scaling experiments:}
+\textbf{Scaling:}
 \begin{itemize}
-    \item Larger models (4B, 7B) where PPO has more room to improve
+    \item Larger models (4B, 7B) where PPO has more headroom
     \item Longer training (1000+ episodes)
-    \item Harder tasks: MATH, code generation, tool use
-    \item Multi-seed evaluation for statistical significance
+    \item Harder tasks: code generation, tool use
 \end{itemize}
 
 \vspace{0.3cm}
-\textbf{Methodological:}
+\textbf{Methods:}
 \begin{itemize}
     \item Entropy-weighted KL penalty (not just policy loss)
-    \item Combine with GRPO, reward shaping, process reward models
+    \item Combine with GRPO, process reward models
     \item Per-layer or per-head importance
 \end{itemize}
 \end{column}
 \begin{column}{0.48\textwidth}
-\textbf{Theoretical:}
+\textbf{Theory:}
 \begin{itemize}
-    \item Tighter bounds on the bias-variance crossover
-    \item Optimal decay schedule beyond MSE criterion
-    \item Connection to exploration-exploitation in token space
+    \item Tighter bounds on bias-variance crossover
+    \item Optimal decay beyond MSE criterion
+    \item Connection to exploration in token space
 \end{itemize}
 
 \vspace{0.3cm}
@@ -519,7 +555,7 @@ With a stronger base model and more training, we expect clearer differentiation 
 \begin{center}
 \fbox{\parbox{0.9\columnwidth}{\centering
 \textit{Token importance is gradient variance reduction.}\\[3pt]
-Like all variance reduction, it matters most when variance is the bottleneck.
+Like all variance reduction, it helps most when variance is the bottleneck.
 }}
 \end{center}
 \end{column}
