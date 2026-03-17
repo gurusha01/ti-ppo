@@ -33,31 +33,14 @@ from ti_ppo import TIPPOConfig, TIPPOTrainer, CausalLMWithValueHead
 # -----------------------------------------------------------------------
 
 METHODS = [
-    # (method, label, extra_config)
-    # GPU 0: baseline
+    # Entropy-only methods (advantage is positional, not content-based)
     ("uniform", "PPO baseline", {}),
-    # GPU 1: AITI-Advantage
-    ("aiti_advantage", "AITI-Advantage", {
-        "aiti_epsilon_max": 1.0, "aiti_decay_steps": 100,
-        "aiti_power": 1.0, "aiti_min_epsilon": 0.0}),
-    # GPU 2: AITI-Entropy
+    ("entropy", "Entropy (fixed)", {}),
     ("aiti_entropy", "AITI-Entropy", {
         "aiti_epsilon_max": 1.0, "aiti_decay_steps": 100,
         "aiti_power": 1.0, "aiti_min_epsilon": 0.0}),
-    # GPU 3: MOAI-Advantage mono (ema=0.80)
-    ("moai_advantage_mono", "MOAI-Adv mono 0.80", {
-        "moai_ema_decay": 0.80, "moai_warmup_steps": 5}),
-    # GPU 4: MOAI-Advantage mono (ema=0.90)
-    ("moai_advantage_mono", "MOAI-Adv mono 0.90", {
+    ("moai_entropy_mono", "MOAI-Entropy", {
         "moai_ema_decay": 0.90, "moai_warmup_steps": 5}),
-    # GPU 5: MOAI-Entropy mono (ema=0.80)
-    ("moai_entropy_mono", "MOAI-Ent mono 0.80", {
-        "moai_ema_decay": 0.80, "moai_warmup_steps": 5}),
-    # GPU 6: MOAI-Entropy mono (ema=0.90)
-    ("moai_entropy_mono", "MOAI-Ent mono 0.90", {
-        "moai_ema_decay": 0.90, "moai_warmup_steps": 5}),
-    # GPU 7: raw advantage (no adaptive decay, for comparison)
-    ("advantage", "Advantage (fixed)", {}),
 ]
 
 # -----------------------------------------------------------------------
