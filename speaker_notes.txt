@@ -3,227 +3,257 @@ SPEAKER NOTES — Entropy-Guided Token Importance for PPO
 
 SLIDE 1: The Problem
 --------------------
-- Open with the PPO loss formula. Point out the 1/T — every token gets
-  the same weight.
-- Give the math example: "Let x = 3 + 4 = 7. Therefore the answer is
-  \boxed{7}". The "7" is everything. "Let" and "Therefore" carry zero
-  reward signal.
-- This means the model is spending gradient budget on tokens that don't
-  matter. Can we do better?
+So the standard PPO objective treats every token the same — there's a
+uniform 1/T average over all positions. But intuitively, some tokens
+matter way more than others. If you look at a math response like
+"Let x = 3 + 4 = 7, therefore the answer is \boxed{7}", the "7" is
+everything — that's where the reward comes from. The "Let" and
+"therefore" are just boilerplate. So the question we're asking is:
+can we weight tokens by how important they are, and does that help
+PPO learn faster or with less KL drift?
+
+There's recent work called TI-DPO that showed this works really well
+for DPO. So we wanted to know: does it also work for PPO?
+
 
 SLIDE 2: Prior Work — TI-DPO
 -----------------------------
-- TI-DPO showed that weighting tokens by importance improves DPO.
-- They used gradient attribution, attention, etc. to score tokens.
-- Key: these work for DPO because DPO has paired sequences (chosen vs
-  rejected). You can identify which tokens are "different" between the
-  good and bad response.
-- This paper is our starting point.
+TI-DPO by Yang et al. introduced per-token importance weights into the
+DPO loss. They tried several scoring methods — gradient norm of the
+embedding, attention scores, a hybrid of gradient plus a Gaussian prior,
+and TD error from a value function. These give you a weight w(t) per
+token, and you multiply the DPO loss by it. They showed +2 to 5% gains
+on preference benchmarks, so it clearly works for DPO.
+
 
 SLIDE 3: Our First Step — Port to PPO
 ---------------------------------------
-- Natural first idea: take TI-DPO's exact importance scores and use them
-  as per-token weights in PPO. So w(t) = gradient norm, or attention
-  received, or the hybrid score — the same signals from the paper.
-- Explain what these scores mean: gradient norm measures how much the
-  embedding at that position contributes to the loss. Attention measures
-  how much other tokens "look at" this token. Hybrid smooths the gradient
-  with a Gaussian prior.
-- But in DPO these scores have a clear interpretation: they tell you
-  which tokens differ between the chosen and rejected response. In PPO
-  there's no rejected response — just one sequence and a scalar reward.
-  So gradient/attention scores don't have the same meaning.
-- Also: PPO runs for hundreds of gradient steps, so any systematic error
-  in the weights accumulates. DPO is a single pass — bias can't compound.
+Our first idea was straightforward: take these exact same importance
+scores from TI-DPO — the gradient norm, the attention weights, the
+hybrid score — and plug them into the PPO clipped surrogate loss as
+per-token weights.
+
+But there's a fundamental difference between DPO and PPO that makes
+this tricky. In DPO, you have paired sequences — a chosen and a rejected
+response. The importance scores naturally capture "which tokens differ
+between the good and bad response." In PPO, you just have a single
+sequence and a scalar reward at the end. There's no rejected response
+to compare against, so gradient attribution and attention scores don't
+have a clear interpretation anymore.
+
+On top of that, PPO runs for hundreds of gradient steps, while DPO is
+typically a single pass. So any systematic error in the weights
+compounds over time.
+
 
 SLIDE 4: Phase 1 Results
 -------------------------
-- Just a quick table showing the numbers. Don't dwell — the point is
-  that direct porting doesn't work.
-- Mention that the hybrid method does have lower KL, so it's not
-  completely useless — it's just not optimizing what we care about
-  (reward).
-- Transition: we need signals that are native to PPO.
+And indeed, when we ran this, the paper's methods actually performed
+worse than vanilla PPO. The hybrid method gets 8% less reward than
+the baseline. It does have lower KL, so it's not completely useless,
+but it's clearly not optimizing what we care about. The takeaway here
+is that we need importance signals that are native to PPO, not borrowed
+from DPO.
+
 
 SLIDE 5: Entropy as Importance
 -------------------------------
-- THIS IS THE KEY SLIDE. Spend time here.
-- Policy entropy at each token position: H(π(·|s_t)). This is how
-  uncertain the model is about what comes next.
-- High entropy = the model sees multiple plausible continuations.
-  This means: (a) there's something to learn here, and (b) the PPO
-  gradient carries useful information at this position.
-- Low entropy = the model is confident. Maybe it's a function word,
-  maybe it's already learned this pattern. Either way, the gradient
-  at this token is mostly noise.
-- We normalize so the mean weight is 1 (preserves the gradient scale)
-  and use it in the PPO loss.
-- Emphasize: this is FREE. Just softmax the existing logits. No extra
-  forward/backward pass.
+So here's our idea. Instead of gradient attribution or attention, we
+use the model's own entropy at each token position. The entropy
+H(π(·|s_t)) measures how uncertain the model is about what token comes
+next at position t. We normalize it to have mean 1 and use it directly
+as the weight in the PPO loss.
+
+Why entropy? Because high entropy means the model sees multiple
+plausible next tokens — it hasn't decided what to do yet. That's
+exactly where a gradient update is most valuable. Low entropy means the
+model is already confident — maybe it's a function word, maybe it
+already knows the answer there. Either way, there's less to gain from
+updating that position.
+
+And crucially, this is free — we already have the logits from the
+forward pass, we just compute the entropy from them. No extra forward
+or backward pass needed.
+
 
 SLIDE 6: Entropy Intuition
 ---------------------------
-- Walk through the table row by row.
-- "Let" — entropy 0.2, model knows how to start. No point focusing here.
-- "=" — entropy 1.4! The model has to compute the answer. There are many
-  possible numbers it could output. This is the critical decision.
-- "105" — entropy 1.2. The actual answer. High uncertainty because the
-  model could output wrong numbers.
-- Ask the audience: if you could only update the model on one token,
-  which would you pick? Entropy identifies the answer automatically.
+Let me make this concrete with an example. If the model is solving
+"What is 15 times 7?", look at the entropy at each token position.
+"Let" has entropy 0.2 — the model knows how to start, there's really
+only one natural continuation. "me" is 0.1, even more obvious.
 
-SLIDE 6b: Doesn't grad log pi already contain this?
----------------------------------------------------
-- This is the natural pushback. Someone in the audience will think:
-  "the gradient itself should encode which tokens matter."
-- The key distinction: grad log pi tells you the DIRECTION to update
-  to make that token more likely. It doesn't tell you whether updating
-  that token is USEFUL.
-- Example: a token where the model is confidently wrong (says "52"
-  when the answer is "105") has SMALL grad log pi (model is confident)
-  AND low entropy. The gradient won't fix it.
-- But a token where the model is uncertain (could say "105" or "52"
-  with similar probability) has HIGH entropy. The gradient at this
-  token has LEVERAGE — a small update can tip the model toward the
-  right answer.
-- So entropy adds information that the gradient doesn't have: which
-  tokens are at a decision boundary where an update actually matters.
-- Another way to think about it: entropy weighting is like adaptive
-  step sizes per token. We take bigger steps where the model is
-  uncertain (likely to benefit) and smaller steps where it's confident
-  (less to gain, risk of undoing what's already learned).
+But when we get to the equals sign — entropy jumps to 1.4. The model
+has to actually compute the answer here. There are many numbers it
+could output. This is the critical decision point. And "105" — the
+actual answer — also has high entropy because the model genuinely
+isn't sure whether to say 105 or some other number.
 
-SLIDE 7: Early Results — Entropy Works... Then Doesn't
--------------------------------------------------------
-- Show the table: entropy weighting is +10% at episode 100. Great!
-- But at episode 150, baseline has overtaken it. What happened?
-- The issue isn't that entropy is a bad signal. It's that we're
-  applying the SAME weights throughout training, but the model changes.
-- At step 1, the model is uncertain about math reasoning — entropy
-  correctly identifies where to learn.
-- At step 150, the model has learned a lot. The tokens that are now
-  high-entropy might be high-entropy for different reasons — maybe the
-  model is exploring alternatives, or maybe the entropy landscape
-  shifted as the policy moved.
-- The weights become stale. The small error per step accumulates over
-  hundreds of steps into a large systematic distortion.
+So entropy naturally identifies the decision points — the tokens where
+the model's choice determines whether the answer is right or wrong.
+These are exactly the positions where PPO's gradient signal is most
+useful.
 
-SLIDE 8: Why Fixed Weights Degrade
+
+SLIDE 7: Doesn't grad log pi already know this?
+-------------------------------------------------
+Now you might ask: doesn't the gradient itself already encode which
+tokens matter? After all, ∇log π is the direction the model would move
+to make each token more likely.
+
+The key distinction is in this table. A confident correct token like
+"the" has small gradient and low entropy — fine, we agree it doesn't
+matter. But a confident WRONG token — say the model confidently outputs
+"52" instead of "105" — also has small gradient AND low entropy. The
+gradient won't fix this because the model is confident.
+
+But an uncertain token — where the model could go either way between
+the right and wrong answer — has high entropy. That's where a gradient
+update has the most leverage. A small push in the right direction can
+tip the balance. So entropy captures something orthogonal to what the
+gradient magnitude tells you.
+
+
+SLIDE 8: Entropy Works Then Doesn't
+-------------------------------------
+So we tried it. We applied entropy weights to the PPO loss and trained
+for 150 episodes. At episode 100, entropy weighting is 10% ahead of
+the baseline — great, it works!
+
+But then by episode 150, the baseline has caught up and surpassed it.
+What happened? The weights stay fixed throughout training, but the model
+is changing underneath. The tokens that were uncertain at the start may
+no longer be the important ones later. The fixed weights become stale,
+and the small error they introduce on each step accumulates over hundreds
+of gradient updates until it's large enough to hurt.
+
+
+SLIDE 9: Why Fixed Weights Degrade
 ------------------------------------
-- Formalize the intuition with the bias-variance decomposition.
-- Bias = Cov(w, f). If the weights correlate with the gradient (they
-  do — that's the whole point), the estimator is biased.
-- Early: variance is high because the policy is still changing rapidly.
-  Entropy weighting reduces variance → net win despite small bias.
-- Late: the policy is more stable, so variance is naturally lower. But
-  the accumulated bias from hundreds of steps with stale weights now
-  dominates.
-- NOTE: "early" and "late" here mean early/late in RL fine-tuning, not
-  pretraining. The base model is already pretrained and capable. But
-  the PPO process itself has dynamics — the policy changes most in the
-  first few hundred updates, then stabilizes.
+Here's the math behind what we just saw. When you weight the gradient by
+w(t), the estimator becomes biased — the bias equals the covariance
+between the weights and the per-token gradient signal. If the weights
+correlate with the gradient magnitude — which they do, that's the whole
+point — then this covariance is non-zero.
 
-SLIDE 9: AITI — The Fix
--------------------------
-- Simple fix: decay ε from 1 to 0. At the start, full entropy
-  weighting. At the end, uniform PPO.
-- The formula: w(t) = 1 + ε(step) × (H_norm(t) - 1). When ε=0,
-  every weight is 1.
-- Analogy to learning rate scheduling: just as you decrease the step
-  size over training, you decrease the entropy weighting intensity.
-  LR controls how far you step; AITI controls where you step.
-- Hyperparameters: the number of decay steps. We tested 100 and 200.
+Early in fine-tuning, the policy is still adapting, gradient variance is
+high, and the variance reduction from entropy weighting outweighs the
+bias. So you learn faster. But later, the policy stabilizes, variance
+drops naturally, and now the accumulated bias from all those weighted
+updates starts to dominate. The gradient is pointing in a slightly wrong
+direction on every step, and eventually that adds up.
 
-SLIDE 10: AITI Results
+And to be clear, "early" and "late" here refers to the RL fine-tuning
+process, not pretraining. Even though the base model is already
+pretrained and capable, the PPO process itself has dynamics — the policy
+changes most in the first few hundred updates, then stabilizes.
+
+
+SLIDE 10: AITI
+---------------
+The fix is actually quite simple. Instead of keeping the entropy weights
+at full intensity the whole time, we decay them. We introduce an
+intensity parameter epsilon that starts at 1 and linearly decays to 0
+over training. When epsilon is 1, you get full entropy weighting. When
+epsilon is 0, you get standard uniform PPO.
+
+Think of it like learning rate scheduling — just as you decrease the
+step size over training, you decrease the weighting intensity. The
+learning rate controls how far you step; AITI controls where the
+gradient focuses. Both should start high and decay.
+
+
+SLIDE 11: AITI Results
 -----------------------
-- Show the table. AITI-Entropy Pareto-dominates PPO baseline: higher
-  reward AND 2.5x lower KL divergence.
-- Fixed entropy (no decay) is dominated — confirms the degradation story.
-- The KL result is interesting: AITI achieves lower KL than baseline,
-  meaning the policy stays closer to the reference while getting better
-  reward. The entropy weighting focuses updates efficiently.
-- TI-DPO hybrid is also dominated, confirming Phase 1 findings.
+And this works. AITI-Entropy Pareto-dominates the PPO baseline — it
+gets higher reward AND 2.5 times lower KL divergence. That means the
+policy improves more while staying closer to the reference model.
+Meanwhile, fixed entropy weighting without decay is dominated — it
+degrades just as we predicted. The decay schedule is what makes entropy
+weighting viable in PPO.
 
-SLIDE 11: MOAI — Can We Do Better Than Scheduled Decay?
----------------------------------------------------------
-- AITI requires choosing a decay schedule. What if we compute the
-  optimal ε at each step?
-- MSE of the gradient estimator = bias² + variance. We want the gradient
-  that's closest to the true gradient in mean squared error.
-- Why MSE? Because the PPO update is θ ← θ + α·g. A lower-MSE estimate
-  of g gives better updates on average. MSE = bias² + variance is the
-  standard decomposition of estimation error.
-- The closed form: ε* = clip(-C/2ρ, 0, ε_prev). The statistics C and ρ
-  are estimated via EMA from the training data.
-- Monotone constraint: ε can only decrease. This prevents oscillation.
 
-SLIDE 12: MOAI Finding — Partial Weighting
---------------------------------------------
-- Interesting result: MOAI settles at ε ≈ 0.3-0.5, not zero.
-- This seems to contradict AITI (which decays to 0). Explain why:
-  - AITI goes to 0 to eliminate ALL bias. This is safe but conservative.
-  - MOAI says: at ε=0.3, the remaining bias² is negligible, but you're
-    still getting meaningful variance reduction from the entropy weights.
-  - Going from ε=0.3 to ε=0 removes very little bias but gives up
-    real variance reduction. Not worth it.
-- So MOAI finds a more nuanced answer: keep some entropy weighting
-  permanently, just not as much as at the start.
-- Show the full table: MOAI gets highest reward, AITI gets best KL.
-  Both Pareto-dominate PPO. Different operating points on the frontier.
+SLIDE 12: MOAI Motivation
+---------------------------
+AITI has one limitation — you have to choose the decay schedule
+yourself. How many steps to decay over? Linear or quadratic? We wanted
+to remove this hyperparameter entirely.
 
-SLIDE 13: Implementation
---------------------------
-- Don't skip this slide — these bugs were real and devastating.
-- fp16 value head: the gradient norm was 4.2 on the first step. In fp16
-  this overflows to NaN. Every subsequent step was silently skipped.
-  The model appeared to train but learned nothing.
-- fp16 log-softmax: the KL between policy and reference was literally
-  0.0000 for the entire run. The PPO ratio was exactly 1.0. No policy
-  gradient at all.
-- Chat template: Qwen instruct models expect <|im_start|>user\n...<|im_end|>
-  format. Without it, the model doesn't enter "instruction following" mode
-  and accuracy drops 12%.
-- Small training pool: with 500 questions and batch_size=4, the model
-  sees most questions multiple times → memorization, not learning.
+The idea is simple: at each step, choose epsilon to minimize the mean
+squared error of the gradient estimator. MSE decomposes into bias
+squared plus variance — this is just the standard bias-variance
+decomposition. A gradient with lower MSE relative to the true gradient
+gives better policy updates on average.
+
+It turns out this has a closed-form solution, which we call MOAI. You
+just compute two statistics from the training data — a covariance and a
+variance term — estimate them with an exponential moving average, and
+plug into the formula. The monotone constraint ensures epsilon only
+decreases, preventing oscillation.
+
+
+SLIDE 13: MOAI Finding
+------------------------
+Here's the interesting finding. MOAI doesn't decay epsilon to zero. It
+converges to around 0.3 to 0.5 and stays there.
+
+This might seem contradictory — didn't we just say you need to decay to
+zero to eliminate bias? Well, AITI decays to zero as a conservative
+choice — it eliminates ALL bias, which is safe but gives up all the
+variance reduction too. MOAI finds a more nuanced answer: at epsilon
+0.3, the remaining bias squared is negligible, but you're still getting
+meaningful variance reduction from the entropy weights. Going from 0.3
+to 0 removes almost no bias but gives up real benefit. So the optimal
+strategy is permanent partial weighting.
+
+And the results confirm this — MOAI gets the highest reward of any
+method, while AITI gets the best KL efficiency. They represent different
+points on the Pareto frontier, and both dominate vanilla PPO.
+
 
 SLIDE 14: GSM8K Results
 -------------------------
-- All methods improve 8% over base model. Good — PPO works.
-- But differences between methods are <1%. The task is too easy for the
-  1.5B model (base already at 55%) to differentiate methods.
-- The batch size finding is more interesting: at bs=1, entropy methods
-  give +4-5% over baseline. This confirms the variance reduction story.
-  Small batches = high variance = entropy weighting helps.
-- If you're training with small batches (common in RLHF due to memory),
-  entropy weighting is essentially free improvement.
+Moving to real math benchmarks. On GSM8K with a 1.5B model, we see that
+all methods improve about 8% over the base model, but the differences
+between entropy methods and baseline are within 1%. The reason is that
+GSM8K is relatively easy for this model — the base already gets 55%, so
+there's limited headroom for PPO, and even less room for entropy
+weighting to differentiate.
+
+These results are from the entropy-only rerun that's currently in
+progress, so the numbers will be updated.
+
 
 SLIDE 15: MATH-500 Results
 ----------------------------
-- Harder task. Base model gets ~30%. PPO only improves by ~1.6%.
-- With so little total PPO improvement, entropy methods can't add much.
-- BUT: in training accuracy, entropy methods are +4% ahead (28% vs 24%).
-  This means the method IS helping with learning — it just doesn't show
-  in the test accuracy because the total effect is too small.
-- Currently running 4B model with 500 episodes — expect more headroom.
-- [UPDATE THESE NUMBERS when 4B results come in]
+MATH is much harder — competition-level problems. We're running this
+with a 4B model and 500 episodes, and the early results at episode 40
+show AITI-Entropy leading at 35.4% versus the baseline at 33.5%. This
+is more promising because there's more room for improvement on this
+harder task.
 
-SLIDE 16: Takeaways
----------------------
-- Four points. Rehearse these — they're the main message.
-  1. Entropy = right signal (content-aware, free, identifies decision points)
-  2. Fixed weighting degrades (bias accumulation in online RL)
-  3. AITI/MOAI fix it (adaptive decay or per-step optimization)
-  4. Most valuable in high-variance settings (small batch, hard tasks)
-- The framing: this is variance reduction for the policy gradient.
+The final results with test accuracy are still running and will be
+filled in once they complete.
 
-SLIDE 17: Future Work
------------------------
-- Scaling is the biggest open question. We need tasks where PPO makes a
-  big difference so we can measure whether entropy weighting makes it
-  even bigger.
-- Code generation is a natural fit — variable names have low entropy
-  (determined by context) while logic has high entropy (many valid
-  implementations).
-- GRPO integration would be interesting — GRPO is gaining popularity
-  as a PPO alternative, and it has the same per-token loss structure.
-- End on the core insight: variance reduction. Simple, free, additive.
+
+SLIDE 16: Future Directions
+-----------------------------
+Looking ahead, the main thing we need is harder tasks where PPO makes a
+bigger difference, so the entropy weighting has more to amplify. Code
+generation is a natural fit — variable names and function signatures have
+low entropy because they're determined by context, while the actual
+logic has high entropy because there are many valid implementations.
+We're already running MBPP experiments.
+
+Scaling to larger models should also help — a 7B model has more capacity
+to benefit from focused gradient updates.
+
+On the methods side, applying entropy weighting to the KL penalty, not
+just the policy loss, could be interesting. And integrating with GRPO,
+which is gaining popularity as a PPO alternative, would broaden the
+applicability.
+
+The core insight to take away is that token importance weighting is
+really gradient variance reduction. And like all variance reduction
+techniques, it helps most when variance is the bottleneck — small
+batches, sparse rewards, early in training, hard tasks.
