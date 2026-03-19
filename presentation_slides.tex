@@ -413,24 +413,24 @@ MOAI achieves the \textbf{highest reward}; AITI achieves the \textbf{best KL-eff
 \vspace{0.2cm}
 \begin{table}
 \small
-\begin{tabular}{lccl}
+\begin{tabular}{lccc}
 \toprule
 Method & Train Acc & Test Acc & vs PPO \\
 \midrule
-\textbf{MOAI-Entropy 0.95} & \textbf{37.4}\% & \textbf{36.7\%} & \textbf{+1.4\%} \\
-MOAI-Entropy 0.90 & 37.2\% & 36.0\% & +0.7\% \\
-MOAI-Entropy 0.80 & 37.4\% & 35.3\% & +0.0\% \\
-PPO baseline & 35.9\% & 35.3\% & --- \\
-Entropy (fixed) & 36.5\% & 34.8\% & $-$0.5\% \\
-AITI-Entropy (decay=100) & 36.6\% & 32.8\% & $-$2.5\% (overfitting) \\
+\textbf{MOAI-Entropy 0.95} & \textbf{37.3\%} & 35.0\% & $-$0.2\% \\
+MOAI-Entropy 0.90 & 36.8\% & \textbf{35.2\%} & +0.0\% \\
+PPO baseline & 35.6\% & 35.2\% & --- \\
+MOAI-Entropy 0.80 & 37.0\% & 33.8\% & $-$1.4\% \\
+Entropy (fixed) & 36.2\% & 33.8\% & $-$1.4\% \\
+AITI-Entropy (decay=100) & 36.2\% & 32.4\% & $-$2.8\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \vspace{0.2cm}
-\textbf{MOAI-Entropy 0.95 leads:} +1.4\% over PPO baseline on test, with lower KL divergence.
+Entropy methods achieve \textbf{+1--2\% higher training accuracy}, indicating faster learning during RL fine-tuning. MOAI-Entropy 0.90 matches baseline on test; AITI and fixed entropy overfit.
 
-MOAI variants consistently outperform --- adaptive $\varepsilon^*$ matters more than scheduled decay on harder tasks.
+With only 500 episodes on 7,500 examples, each problem is seen $<$1 time. Full 3-epoch training (currently running) should show clearer differentiation.
 
 \end{frame}
 

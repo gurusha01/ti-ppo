@@ -1,0 +1,26 @@
+{
+  "math_test": {
+    "PPO baseline": 0.352,
+    "Entropy (fixed)": 0.338,
+    "AITI-Ent (d=100)": 0.324,
+    "MOAI-Ent 0.80": 0.338,
+    "MOAI-Ent 0.90": 0.352,
+    "MOAI-Ent 0.95": 0.35,
+    "AITI-Ent (res=0.3)": 0.336
+  },
+  "math_train": {
+    "PPO baseline": 0.356,
+    "Entropy (fixed)": 0.3615,
+    "AITI-Ent (d=100)": 0.362,
+    "MOAI-Ent 0.80": 0.37,
+    "MOAI-Ent 0.90": 0.368,
+    "MOAI-Ent 0.95": 0.3725,
+    "AITI-Ent (res=0.3)": 0.371
+  },
+  "gsm8k_train": {
+    "PPO baseline": 0.6825,
+    "Entropy (fixed)": 0.6837,
+    "AITI-Entropy": 0.6913,
+    "MOAI-Entropy": 0.6587
+  }
+}
